@@ -59,7 +59,18 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    #
+    # Global flags may sit between `hermes` and `gateway`
+    # (`hermes -p venus gateway restart`, `hermes --profile venus gateway
+    # stop`). Requiring literal adjacency blocked only the form nobody
+    # types while permitting the profile-flag form our own runbooks
+    # document, so the guard read green while the real command sailed
+    # through (#78028). `(?:-{1,2}\S+(?:\s+\S+)?\s+)*` absorbs any run of
+    # short/long flags with optional values — the same shape
+    # `tools/approval.py` already uses for this command family. Anchoring
+    # each flag on a leading dash keeps the branch shell-command-shaped so
+    # it still cannot fire on prose that merely mentions both words.
+    r"(?:hermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(?:restart|stop))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -95,12 +106,55 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
 
+# Branch A now matches flag-interposed forms, which includes
+# `hermes -p <other> gateway restart` — a SIBLING bounce. That shape is not
+# the foot-gun this guard exists to stop: the danger is a gateway SIGTERMing
+# itself mid-command, and restarting a *different* profile's gateway does not
+# touch this process. It is also the only working route from inside a gateway
+# and is documented in our runbooks, so blocking it outright would trade a
+# silent bypass for a silent capability loss.
+#
+# Extract an explicit `-p/--profile <name>` target and compare it to the
+# running profile. Fail CLOSED in every ambiguous case: no flag, unreadable
+# name, or a name equal to the current profile all stay blocked.
+_PROFILE_TARGET_RE = re.compile(
+    r"(?:^|\s)(?:-p|--profile)(?:[=\s]+)([A-Za-z0-9._-]+)"
+)
+
+# Branch A in isolation, so the sibling exemption below can be scoped to the
+# `hermes ... gateway ...` CLI form only. Kept textually in sync with the
+# Branch A alternative inside _GATEWAY_LIFECYCLE_PATTERN.
+_BRANCH_A_RE = re.compile(
+    r"(?i)hermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(?:restart|stop)"
+)
+
+
+def _targets_only_other_profiles(text: str) -> bool:
+    """True when every gateway command in *text* names a different profile."""
+    current = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not current:
+        # Can't prove it's a sibling -> treat as self-targeting.
+        return False
+    targets = _PROFILE_TARGET_RE.findall(text or "")
+    if not targets:
+        return False
+    return all(t.strip() != current for t in targets)
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+    if not _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+        return False
+    # Only Branch A (the `hermes ... gateway ...` CLI form) carries a profile
+    # flag. launchctl/systemctl/pkill shapes name a label or process instead
+    # and must never be exempted here.
+    if _BRANCH_A_RE.search(normalized) and _targets_only_other_profiles(normalized):
+        # Sibling bounce: does not SIGTERM this gateway.
+        return False
+    return True
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -356,7 +410,11 @@ def _iter_referenced_shell_scripts(
         executable = segment[index]
         executable_name = Path(executable).name
 
-        if executable_name in {".", "source"}:
+        # Compare the RAW token as well as the basename: `Path(".").name` is the
+        # empty string, so a basename-only test silently misses the dot operator
+        # while still catching `source`. `. ./restart.sh` is exactly equivalent
+        # to `source ./restart.sh`, so both must reach the referenced-script scan.
+        if executable in {".", "source"} or executable_name == "source":
             if len(segment) > index + 1:
                 resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
                 if resolved is not None:
@@ -425,6 +483,38 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
+_BINARY_MAGICS = (
+    b"\x7fELF",              # ELF — Linux/BSD executables and shared objects
+    b"\xfe\xed\xfa\xce",     # Mach-O 32-bit
+    b"\xfe\xed\xfa\xcf",     # Mach-O 64-bit
+    b"\xce\xfa\xed\xfe",     # Mach-O 32-bit, byte-swapped
+    b"\xcf\xfa\xed\xfe",     # Mach-O 64-bit, byte-swapped
+    b"\xca\xfe\xba\xbe",     # Mach-O universal ("fat") binary
+    b"MZ",                   # PE/COFF — Windows .exe/.dll
+    b"!<arch>",              # static archive (.a)
+    b"\x1f\x8b",             # gzip
+    b"PK\x03\x04",           # zip (also .jar/.whl/.egg)
+)
+
+
+def _has_binary_magic(data: bytes) -> bool:
+    """Return True when *data* starts with a known compiled-binary signature.
+
+    Deliberately narrower than "contains a NUL byte": a shell script that
+    happens to hold a NUL is still executed by ``bash``, so treating every
+    NUL-bearing file as an unscannable binary lets a padded script bypass the
+    lifecycle scan entirely.
+
+    A shebang always wins — an interpreted script is never a binary, however
+    odd its payload. File extensions are deliberately *not* consulted: a
+    suffixless shell script must still be scanned (and, if oversized, still
+    fail closed).
+    """
+    if data.startswith(b"#!"):
+        return False
+    return data.startswith(_BINARY_MAGICS)
+
+
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
@@ -442,12 +532,20 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         # Sniff a small prefix first: files that are clearly compiled
-        # binaries (executable magic, or NUL bytes in the head) are never
-        # shell scripts, so skip them WITHOUT reading the rest — reading a
-        # megabyte of machine code just to discard it wastes the guard's
-        # budget and (pre-#77703) fed decoded garbage into the recursion.
+        # binaries are never shell scripts, so skip them WITHOUT reading the
+        # rest — reading a megabyte of machine code just to discard it wastes
+        # the guard's budget and (pre-#77703) fed decoded garbage into the
+        # recursion.
+        #
+        # ⛔ This early exit must use the SAME test as the post-read check
+        # below (_has_binary_magic), NOT "contains a NUL". An early sniff that
+        # bails on any NUL re-opens the exact bypass the post-read check was
+        # written to close: `bash` runs a *text* script straight past an
+        # embedded NUL, so one pad byte returned "nothing to scan" here and the
+        # magic-number logic below was never reached. Two checks answering the
+        # same question with different rules means the WEAKER one decides.
         data = os.read(descriptor, _BINARY_SNIFF_BYTES)
-        if data.startswith(_BINARY_MAGIC_PREFIXES) or b"\x00" in data:
+        if _has_binary_magic(data):
             return None, False
         # Read the remainder (bounded). Loop because os.read may return
         # short for non-regular-file-backed descriptors.
@@ -462,16 +560,25 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     finally:
         os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
-    if b"\x00" in data:
+    # Identify binaries by MAGIC NUMBER, not by the mere presence of a NUL.
+    #
+    # "contains a NUL" and "is a compiled binary" are different questions, and
+    # the gap between them is a guard bypass: `bash` executes a *text* script
+    # straight past an embedded NUL, so a single pad byte in a shell script made
+    # the scan skip a file that still runs its lifecycle command. Match on the
+    # signature instead (ELF/Mach-O/PE/static archive/compressed), and treat a
+    # NUL-bearing *text* file as a script whose NULs are stripped before
+    # scanning — stripping can only splice tokens together, never apart, so it
+    # fails closed.
+    if _has_binary_magic(data):
         return None, False
+    # Check the size BEFORE stripping: stripping shrinks the buffer, so doing it
+    # first would let an oversized file slip under the threshold and skip this
+    # fail-closed branch.
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
+    if b"\x00" in data:
+        data = data.replace(b"\x00", b"")
     return data.decode("utf-8", errors="replace"), False
 
 

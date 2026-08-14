@@ -59,7 +59,7 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    r"(?:hermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(?:restart|stop))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -95,12 +95,58 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
 
+# Branch A now matches flag-interposed forms, which includes
+# `hermes -p <other> gateway restart` — a SIBLING bounce. That shape is not
+# the foot-gun this guard exists to stop: the danger is a gateway SIGTERMing
+# itself mid-command, and restarting a *different* profile's gateway does not
+# touch this process. It is also the only working route from inside a gateway
+# and is documented in our runbooks, so blocking it outright would trade a
+# silent bypass for a silent capability loss.
+#
+# Extract an explicit `-p/--profile <name>` target and compare it to the
+# running profile. Fail CLOSED in every ambiguous case: no flag, unreadable
+# name, or a name equal to the current profile all stay blocked.
+_PROFILE_TARGET_RE = re.compile(
+    r"(?:^|\s)(?:-p|--profile)(?:[=\s]+)([A-Za-z0-9._-]+)"
+)
+
+# Branch A in isolation, so the sibling exemption below can be scoped to the
+# `hermes ... gateway ...` CLI form only. Kept textually in sync with the
+# Branch A alternative inside _GATEWAY_LIFECYCLE_PATTERN.
+_BRANCH_A_RE = re.compile(
+    r"(?i)hermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(?:restart|stop)"
+)
+
+
+def _targets_only_other_profiles(text: str) -> bool:
+    """True when every gateway command in *text* names a different profile."""
+    current = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not current:
+        # Can't prove it's a sibling -> treat as self-targeting.
+        return False
+    targets = _PROFILE_TARGET_RE.findall(text or "")
+    if not targets:
+        return False
+    return all(t.strip() != current for t in targets)
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+    if not _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+        return False
+    # Sibling exemption, scoped to Branch A only. If every lifecycle hit in
+    # this text is the `hermes ... gateway restart|stop` CLI form AND every
+    # such form names a profile other than the running one, it cannot
+    # SIGTERM this process, so allow it. launchctl/systemctl forms (Branches
+    # B/C) name a label or process, never a profile, and are never exempt:
+    # stripping Branch A matches must leave no other lifecycle match behind.
+    residue = _BRANCH_A_RE.sub(" ", normalized)
+    if _GATEWAY_LIFECYCLE_PATTERN.search(residue):
+        return True
+    return not _targets_only_other_profiles(normalized)
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})

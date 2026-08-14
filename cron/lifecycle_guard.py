@@ -532,12 +532,20 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
                 return None, False
             return None, True
         # Sniff a small prefix first: files that are clearly compiled
-        # binaries (executable magic, or NUL bytes in the head) are never
-        # shell scripts, so skip them WITHOUT reading the rest — reading a
-        # megabyte of machine code just to discard it wastes the guard's
-        # budget and (pre-#77703) fed decoded garbage into the recursion.
+        # binaries (executable magic) are never shell scripts, so skip them
+        # WITHOUT reading the rest — reading a megabyte of machine code just
+        # to discard it wastes the guard's budget and (pre-#77703) fed decoded
+        # garbage into the recursion.
+        #
+        # ⛔ Do NOT reintroduce `or b"\x00" in data` here. A NUL byte does not
+        # mean "compiled binary": bash executes a *text* script straight past
+        # an embedded NUL and rejoins the halves, so bailing on any NUL lets a
+        # single pad byte (or a keyword split across one) bypass the scan.
+        # That is the #77928 bypass. This early sniff MUST use the same
+        # magic-number predicate as the post-read check below, or that check
+        # becomes unreachable dead code.
         data = os.read(descriptor, _BINARY_SNIFF_BYTES)
-        if data.startswith(_BINARY_MAGIC_PREFIXES) or b"\x00" in data:
+        if _has_binary_magic(data):
             return None, False
         # Read the remainder (bounded). Loop because os.read may return
         # short for non-regular-file-backed descriptors.

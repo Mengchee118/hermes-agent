@@ -1559,4 +1559,4 @@ class TestLifecycleGuardNeverRaises:
             check_gateway_lifecycle("clean prompt", value)  # must not raise
         if os.name != "nt":
             with pytest.raises(GatewayLifecycleBlocked):
-                check_gateway_lifecycle("clean prompt", value)
+                check_gateway_lifecycle("clean prompt", "/dev/null")

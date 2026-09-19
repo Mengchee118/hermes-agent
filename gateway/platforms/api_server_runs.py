@@ -177,6 +177,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._stopping_run_ids: set[str] = set()
     self._shutdown_interrupted_run_ids: set[str] = set()
     self._run_shutdown_requested_at: Optional[float] = None
+    self._run_clarify_cards: dict = {}
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
@@ -245,6 +246,8 @@ def _mark_shutdown_interrupted_runs(self, run_ids) -> None:
             error="Gateway shutdown interrupted the run.",
             last_event="run.interrupted",
         )
+        from gateway.platforms.api_server_clarify import clear_run_clarify
+        clear_run_clarify(self, run_id)
 
 
 def _mark_shutdown_requested(self) -> int:
@@ -304,7 +307,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
 def _room_permission_for(request: "web.Request") -> str:
     if request.path.endswith("/stop"):
         return "stop"
-    if request.path.endswith("/approval"):
+    if request.path.endswith(("/approval", "/clarify")):
         return "approve"
     return "status" if request.method == "GET" else "dispatch"
 
@@ -915,6 +918,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 interim_assistant_callback=_interim_cb, **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
+        from gateway.platforms.api_server_clarify import make_clarify_callback
+        agent.clarify_callback = make_clarify_callback(self, run, loop)
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
             loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
@@ -949,6 +954,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
+        from gateway.platforms.api_server_clarify import retire_run_clarify
+        await retire_run_clarify(self, run_id)
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
@@ -1168,6 +1175,8 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    from gateway.platforms.api_server_clarify import retire_run_clarify
+    await retire_run_clarify(self, run_id)
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")

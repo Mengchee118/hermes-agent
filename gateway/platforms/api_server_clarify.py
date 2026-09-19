@@ -14,11 +14,13 @@ def interactive_run_toolsets(config):
     """Enable clarify for interactive defaults without overriding user restrictions."""
     from hermes_cli.tools_config import _get_platform_tools
 
+    enabled = _get_platform_tools(config, "api_server")
     platforms = config.get("platform_toolsets") or {}
     if "api_server" not in platforms:
         config = {**config, "platform_toolsets": {
-            **platforms, "api_server": ["hermes-api-server", "clarify"]}}
-    return _get_platform_tools(config, "api_server")
+            **platforms, "api_server": sorted(enabled | {"clarify"})}}
+        return _get_platform_tools(config, "api_server")
+    return enabled
 
 
 class APIClarifyMixin:

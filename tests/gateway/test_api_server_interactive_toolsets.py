@@ -49,6 +49,14 @@ def test_agent_constructor_receives_tools_and_room_policy_wins(monkeypatch, inte
         adapter._close_cached_session_dbs()
 
 
+def test_legacy_opt_in_is_not_removed():
+    from hermes_cli.tools_config import _get_platform_tools
+    config = {'toolsets': ['kanban']}
+    baseline = _get_platform_tools(config, 'api_server')
+    assert 'kanban' in baseline
+    assert interactive_run_toolsets(config) == baseline | {'clarify'}
+
+
 def test_noninteractive_default_still_has_no_clarify():
     from hermes_cli.tools_config import _get_platform_tools
     baseline = _get_platform_tools({}, 'api_server')

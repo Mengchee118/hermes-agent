@@ -206,7 +206,10 @@ async def test_run_clarify_registry_endpoint_round_trip(adapter, monkeypatch, ou
             finished.set()
 
     agent.run_conversation.side_effect = conversation
-    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: agent)
+    def create_agent(**kwargs):
+        assert kwargs['interactive_run'] is True
+        return agent
+    monkeypatch.setattr(adapter, "_create_agent", create_agent)
     timeout = {"timeout": 2, "answer": 10}.get(outcome, 0)
     monkeypatch.setattr(clarify, "get_clarify_timeout", lambda: timeout)
     headers = {"Authorization": "Bearer test-key"}

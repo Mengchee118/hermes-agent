@@ -10,6 +10,17 @@ from gateway.platforms import api_server_runs as runs
 from gateway.platforms.base import SendResult
 
 
+def interactive_run_toolsets(config):
+    """Enable clarify for interactive defaults without overriding user restrictions."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    platforms = config.get("platform_toolsets") or {}
+    if "api_server" not in platforms:
+        config = {**config, "platform_toolsets": {
+            **platforms, "api_server": ["hermes-api-server", "clarify"]}}
+    return _get_platform_tools(config, "api_server")
+
+
 class APIClarifyMixin:
     async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
         from tools import clarify_gateway as clarify

@@ -178,13 +178,21 @@ def _save_codex_tokens(
         _save_auth_store(auth_store)
 
 
-def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
+def _recover_codex_tokens_from_cli(
+        reason: str, observed_access_token: Optional[str] = None) -> Optional[Dict[str, str]]:
     """Adopt a valid Codex CLI token pair into Hermes auth, if available.
 
     Automatic adoption only; the interactive import offer in ``_login_openai_codex`` asks first and is
-    not subject to ``auth.adopt_external_logins``."""
+    not subject to ``auth.adopt_external_logins``.
+
+    ``observed_access_token`` is the singleton access_token (or None) the caller saw when it decided
+    the credential needs repair. Recovery repairs THAT credential and nothing else (#73667): a Codex
+    Desktop/CLI login into another ChatGPT workspace must not replace it silently, and a concurrent
+    explicit re-auth must not be overwritten, so the save is a compare-and-swap under the store lock.
+    """
+    from agent.credential_pool import _codex_principal_identity
     from agent.credential_sources import adopt_external_logins_enabled
-    from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
+    from hermes_cli.auth import _import_codex_cli_tokens, _provider_state_transaction, _save_codex_tokens
     if not adopt_external_logins_enabled():
         return None
     imported = _import_codex_cli_tokens()
@@ -193,8 +201,22 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
     if not (imported and _stripped(imported.get("access_token"))
             and _stripped(imported.get("refresh_token"))):
         return None
-    logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
+    observed = _stripped(observed_access_token) or None
+    with _provider_state_transaction("openai-codex") as (_store, state, _source):
+        stored = (state or {}).get("tokens")
+        stored = stored if isinstance(stored, dict) else {}
+        if (_stripped(stored.get("access_token")) or None) != observed:
+            logger.info("Codex CLI recovery skipped (%s): the credential was re-authenticated meanwhile.", reason)
+            return None
+        known = _codex_principal_identity(observed)
+        if known and _codex_principal_identity(imported["access_token"]) not in (None, known):
+            logger.warning(
+                "Codex CLI recovery refused (%s): the Codex CLI login belongs to a different ChatGPT "
+                "workspace than the Hermes credential. Run `%s` to re-authenticate it.",
+                reason, _codex_relogin_command())
+            return None
+        logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
+        _save_codex_tokens(imported)  # nested: the per-path lock is reentrant
     return dict(imported)
 
 
@@ -475,7 +497,8 @@ def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -
             if not getattr(exc, "relogin_required", False):
                 raise
             imported = _recover_codex_tokens_from_cli(
-                f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}")
+                f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}",
+                observed_access_token=stored_at or None)
             if not imported:
                 raise
             return imported
@@ -534,16 +557,28 @@ def resolve_codex_runtime_credentials(
         _read_codex_tokens)
     read_error: Optional[AuthError] = None
     data = None
+    observed: Optional[str] = None
     try:
-        # A read-only report takes no store lock: ``_save_auth_store`` replaces auth.json
-        # atomically, and materialising ``auth.lock`` is itself a write a diagnostic must not make.
-        data = _read_codex_tokens(_lock=not read_only)
+        if read_only:
+            # A read-only report takes no store lock: ``_save_auth_store`` replaces auth.json
+            # atomically, and materialising ``auth.lock`` is itself a write a diagnostic must not
+            # make. No recovery follows a read-only read, so no observed token is needed.
+            data = _read_codex_tokens(_lock=False)
+        else:
+            with _auth_store_lock():
+                # Observe the singleton in the same locked snapshot the read validates, so recovery
+                # can compare-and-swap against exactly the credential it is repairing (#73667).
+                from hermes_cli.auth import _load_auth_store, _load_provider_state
+                raw = (_load_provider_state(_load_auth_store(), "openai-codex") or {}).get("tokens")
+                observed = raw.get("access_token") if isinstance(raw, dict) else None
+                data = _read_codex_tokens(_lock=False)
     except AuthError as exc:
         read_error = exc
         if not read_only and exc.relogin_required and exc.code in {
             "codex_auth_missing_access_token", "codex_auth_missing_refresh_token",
             "codex_auth_invalid_shape"}:
-            imported = _recover_codex_tokens_from_cli(str(exc.code or "auth_error"))
+            imported = _recover_codex_tokens_from_cli(
+                str(exc.code or "auth_error"), observed_access_token=observed)
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
     if data is None:
@@ -839,12 +874,14 @@ def _pool_codex_access_token() -> str:
 
 
 def _login_openai_codex(args, pconfig: ProviderConfig, *, force_new_login: bool = False) -> None:
-    """OpenAI Codex login via device code flow. Tokens stored in ~/.hermes/auth.json."""
+    """OpenAI Codex login: device code by default, browser PKCE when opted in (``--browser`` /
+    ``auth.codex_login_flow``). Tokens stored in ~/.hermes/auth.json."""
     from hermes_cli.auth import (
-        _codex_access_token_is_expiring, _codex_device_code_login, _import_codex_cli_tokens,
+        _codex_access_token_is_expiring, _import_codex_cli_tokens,
         _offer_existing_oauth_credentials, _print_login_success, _prompt_yes_no, _save_codex_tokens,
         _update_config_for_provider, resolve_codex_runtime_credentials)
-    del args, pconfig  # kept for parity with other provider login helpers
+    from hermes_cli.auth_codex_browser import codex_oauth_login
+    del pconfig  # kept for parity with other provider login helpers
     if not force_new_login:
         if _offer_existing_oauth_credentials(
             "openai-codex", resolve=resolve_codex_runtime_credentials,
@@ -866,12 +903,10 @@ def _login_openai_codex(args, pconfig: ProviderConfig, *, force_new_login: bool 
                 print(f"  Config updated: {config_path} (model.provider=openai-codex)")
                 return
 
-    # Run a fresh device code flow — Hermes gets its own OAuth session
+    # Run a fresh OAuth flow — Hermes gets its own session (device code unless the user opted in
+    # to the browser flow).
     print()
-    print("Signing in to OpenAI Codex...")
-    print("(Hermes creates its own session — won't affect Codex CLI or VS Code)")
-    print()
-    creds = _codex_device_code_login()
+    creds = codex_oauth_login(args)
     _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
     config_path = _update_config_for_provider(
         "openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))

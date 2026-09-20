@@ -643,6 +643,21 @@ def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
     return (provider or "").strip().lower() in {"lmstudio", "openai-codex"}
 
 
+def _is_codex_route(provider: str, base_url: str, custom_providers: list | None) -> bool:
+    """True when the request travels the Codex Responses wire regardless of host: the native
+    ``openai-codex`` provider (also behind a ``HERMES_CODEX_BASE_URL`` / ``model.base_url`` proxy)
+    or a custom entry declaring ``api_mode: codex_responses``. The transport, not the hostname,
+    decides which window the model actually gets (#116191)."""
+    if (provider or "").strip().lower() == "openai-codex":
+        return True
+    if not base_url:
+        return False
+    with contextlib.suppress(Exception):  # config unreadable → not a known Codex route
+        from hermes_cli.config import get_custom_provider_api_mode
+        return get_custom_provider_api_mode(base_url, custom_providers) == "codex_responses"
+    return False
+
+
 def _save_unless_skipped(model: str, base_url: str, ctx: int, provider: str) -> None:
     """Persist ``ctx`` unless the provider opts out of the disk cache."""
     if not _skip_persistent_context_cache(base_url, provider):
@@ -1324,6 +1339,10 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         r'available\s+tokens[:\s]+(\d+)',
         # Switchyard: "max_tokens cannot exceed the configured model output limit of 16384".
         r'output limit (?:of|is)\s*(\d+)',
+        # Azure OpenAI: "max_tokens is too large: 65536. This model supports at most 32768 completion tokens."
+        r'supports at most\s+(\d+)\s*(?:completion\s+)?tokens',
+        # Scaleway: "max_completion_tokens is limited to 16384 for glm-5.2".
+        r'(?:max_tokens|max_completion_tokens) is limited to\s*(\d+)',
         r'=\s*(\d+)\s*$',
     ):
         match = re.search(pattern, error_lower)
@@ -1346,6 +1365,12 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         _available = int(_m_ctx_tok.group(1)) - (int(_m_chars.group(1)) + 2) // 3
         if _available >= 1:
             return _available
+    # SGLang: "maximum context length of 131072 tokens. You requested a total of 132528 tokens: 66992 tokens
+    # from the input messages and 65536 tokens for the completion" -> window - input (None when the input
+    # alone overflows -> compress).
+    _m_sglang = _sglang_window_and_input(error_lower)
+    if _m_sglang and _m_sglang[0] - _m_sglang[1] >= 1:
+        return _m_sglang[0] - _m_sglang[1]
     # vLLM: window and prompt both in TOKENS; available = window - input (None when the input alone
     # overflows -> compress). When max_tokens is the BINDING constraint vLLM reports "at least N input
     # tokens" with N == window + 1 - requested_output, so window - N == requested_output - 1 and each
@@ -1372,6 +1397,8 @@ _OUTPUT_CAP_SIGNALS = (
     ("in the output", "maximum context length"), ("requested", "output tokens"),
     ("should be",), ("less than or equal",), ("must be",), ("exceeds model", "maximum output tokens"),
     ("output limit",), ("maximum allowed number of output tokens",),
+    ("max_tokens is too large", "supports at most"), ("tokens from the input messages", "tokens for the completion"),
+    ("limited to",),  # Scaleway: "max_completion_tokens is limited to 16384 for <model>" (#67453)
 )
 _INPUT_OVERFLOW_SIGNALS = (
     "prompt is too long", "prompt too long", "input is too long", "input token",
@@ -1388,7 +1415,16 @@ _PARSEABLE_OUTPUT_CAP_SIGNALS = (
     ("maximum context length", "in the completion"), ("maximum context length", "for the completion"),
     ("range of max_tokens should be",), ("exceeds model", "maximum output tokens"),
     ("output limit",), ("max_tokens", "maximum allowed number of output tokens"),
+    ("max_tokens is too large", "supports at most"), ("tokens from the input messages", "tokens for the completion"),
+    ("limited to",),
 )
+
+
+def _sglang_window_and_input(error_lower: str) -> Optional[Tuple[int, int]]:
+    """``(window, input_tokens)`` from SGLang's wording, else None; both figures are explicit there."""
+    _m_ctx = re.search(r'maximum context length of (\d+)\s*token', error_lower)
+    _m_in = re.search(r'(\d+)\s*tokens from the input messages', error_lower)
+    return (int(_m_ctx.group(1)), int(_m_in.group(1))) if _m_ctx and _m_in else None
 
 
 def _any_phrase_group(text: str, groups: tuple) -> bool:
@@ -1405,10 +1441,13 @@ def is_output_cap_error(error_msg: str) -> bool:
     if _completion_split_budget(error_lower) is not None:
         return True
     # An error that ALSO describes an oversized INPUT is a genuine overflow — compression can fix it.
+    # SGLang states both figures: input >= window is that same genuine overflow.
+    _m_sglang = _sglang_window_and_input(error_lower)
     return (
-        any(p in error_lower for p in ("max_tokens", "max_output_tokens", "max_completion_tokens"))
+        any(p in error_lower for p in ("max_tokens", "max_output_tokens", "max_completion_tokens", "tokens for the completion"))
         and _any_phrase_group(error_lower, _OUTPUT_CAP_SIGNALS)
         and not any(p in error_lower for p in _INPUT_OVERFLOW_SIGNALS)
+        and not (_m_sglang and _m_sglang[1] >= _m_sglang[0])
     )
 
 
@@ -1757,6 +1796,9 @@ def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
 
 
 _codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
+# ``{slug: max_context_window}`` from the same fetch, keyed by the same token fingerprint. Only the
+# opted-in ``-900k`` bump reads it (#105443); a catalog without the field leaves the entry empty.
+_codex_oauth_max_context_cache: Dict[str, Dict[str, int]] = {}
 _CODEX_OAUTH_CONTEXT_CACHE_TTL = 3600  # 1 hour
 # The Codex models endpoint reads ``client_version`` as a Codex CLI compatibility version and
 # hides models whose ``minimal_client_version`` is newer, so a made-up version (the old
@@ -1774,8 +1816,9 @@ def _codex_oauth_token_fingerprint(access_token: str) -> str:
 
 def _fetch_codex_oauth_context_lengths_with_source(access_token: str) -> Tuple[Dict[str, int], bool]:
     """Codex catalogue ``{slug: context_window}`` plus whether it came from HTTP. Cached per token
-    fingerprint (windows vary by entitlement). An in-process hit reports False: not a fresh
-    provider confirmation, must not drive persistent writes."""
+    fingerprint (windows vary by entitlement); ``max_context_window`` lands in
+    ``_codex_oauth_max_context_cache`` under the same key. An in-process hit reports False: not a
+    fresh provider confirmation, must not drive persistent writes."""
     now = time.time()
     cache_key = _codex_oauth_token_fingerprint(access_token)
     cached = _codex_oauth_context_cache.get(cache_key)
@@ -1796,12 +1839,16 @@ def _fetch_codex_oauth_context_lengths_with_source(access_token: str) -> Tuple[D
         logger.debug("Codex /models probe failed: %s", exc)
         return {}, False
     result: Dict[str, int] = {}
+    max_result: Dict[str, int] = {}
     for item in data.get("models", []) if isinstance(data, dict) else []:
-        slug, ctx = (item.get("slug"), item.get("context_window")) if isinstance(item, dict) else (None, None)
+        slug, ctx, max_ctx = (item.get("slug"), item.get("context_window"), item.get("max_context_window")) if isinstance(item, dict) else (None, None, None)
         if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
             result[slug.strip()] = ctx
+            if isinstance(max_ctx, int) and max_ctx > 0:
+                max_result[slug.strip()] = max_ctx
     if result:
         _codex_oauth_context_cache[cache_key] = (result, now)
+        _codex_oauth_max_context_cache[cache_key] = max_result
     return result, True
 
 
@@ -1812,10 +1859,12 @@ def _resolve_codex_oauth_context_length_with_source(model: str, access_token: st
     model_bare = _strip_provider_prefix(model).strip()
     if not model_bare:
         return None, ""
-    def _apply_verified_bump(ctx: int, source: str) -> Tuple[int, str]:
-        """Lift an EXACT stale 272K advertisement to the verified cap for opted-in ``-900k`` variants only."""
+    def _apply_verified_bump(ctx: int, source: str, catalog_max: Optional[int] = None) -> Tuple[int, str]:
+        """Lift an EXACT stale 272K advertisement to the verified cap for opted-in ``-900k`` variants only,
+        never above the catalog's own ``max_context_window`` when it publishes one (#105443)."""
         bumped = _verified_codex_ctx_for_slug(model_bare)
         if bumped is not None and ctx == _CODEX_OAUTH_STALE_ADVERTISED_CTX:
+            bumped = min(bumped, catalog_max) if catalog_max else bumped
             logger.debug("Codex OAuth context for %s: advertised %d raised to live-verified %d", model_bare, ctx, bumped)
             return bumped, source
         return ctx, source
@@ -1827,12 +1876,11 @@ def _resolve_codex_oauth_context_length_with_source(model: str, access_token: st
     lookup_bare = _bare_codex_slug(strip_codex_context_variant_suffix(model_bare))
     if access_token:
         live, fresh_probe = _fetch_codex_oauth_context_lengths_with_source(access_token)
+        live_max = _codex_oauth_max_context_cache.get(_codex_oauth_token_fingerprint(access_token), {})
         # Exact slug, then case-insensitive in case casing drifts.
-        hit = live.get(lookup_bare)
-        if hit is None:
-            hit = next((ctx for slug, ctx in live.items() if slug.lower() == lookup_bare.lower()), None)
-        if hit is not None:
-            return _apply_verified_bump(hit, "live" if fresh_probe else "memory")
+        slug = lookup_bare if lookup_bare in live else next((s for s in live if s.lower() == lookup_bare.lower()), None)
+        if slug is not None:
+            return _apply_verified_bump(live[slug], "live" if fresh_probe else "memory", live_max.get(slug))
     hit = _longest_key_match(_CODEX_OAUTH_CONTEXT_FALLBACK, lookup_bare.lower())
     return _apply_verified_bump(hit[1], "fallback") if hit else (None, "")
 
@@ -1990,6 +2038,19 @@ def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: 
     return DEFAULT_FALLBACK_CONTEXT
 
 
+def _resolve_custom_codex_route_context_length(model: str, base_url: str, api_key: str, provider: str) -> int:
+    """Step 2 for a custom ``api_mode: codex_responses`` route — a Codex proxy on a generic URL.
+    The Codex OAuth table (with the opted-in ``-900k`` bump) answers first: the proxy's own /models
+    and the direct-API catalog both advertise the 1.05M direct window that Codex does not honour.
+    No live catalog probe — the route's key is the proxy's, not a ChatGPT token. Slugs the table
+    does not know take the ordinary endpoint probes."""
+    ctx, _source = _resolve_codex_oauth_context_length_with_source(model)
+    if ctx:
+        logger.info("Using Codex OAuth context length %s for model %r (codex_responses route at %s)", f"{ctx:,}", model, base_url)
+        return ctx
+    return _resolve_custom_endpoint_context_length(model, base_url, api_key, provider)
+
+
 def _resolve_moa_context_length(model: str, custom_providers: list | None) -> Optional[int]:
     """Step 0a: MoA virtual provider — ``model`` is a preset name, so every probe would miss. Resolve
     the aggregator's real provider+model (references are advisory). None on any failure."""
@@ -2029,7 +2090,9 @@ def _config_override_context_length(model: str, base_url: str, provider: str, cu
     # 0c. custom_providers per-model override — check before any probe. This closes the gap where /model
     # switch and display paths used to fall back to 128K despite the user having a per-model context_length
     # set. See #15779.
-    if custom_providers and base_url and model:
+    # Not gated on custom_providers: callers that never load the route list pass None and the
+    # helper self-resolves it from config (#69807).
+    if base_url and model:
         with contextlib.suppress(Exception):  # fall through to probing
             from hermes_cli.config import get_custom_provider_context_length
             cp_ctx = get_custom_provider_context_length(model=model, base_url=base_url, custom_providers=custom_providers)
@@ -2142,8 +2205,12 @@ def get_model_context_length(
     if endpoint_context is not None:
         return endpoint_context
     is_bedrock_context = _is_bedrock_context(base_url, provider)
-    # 1. Persistent cache (LM Studio / Codex OAuth excluded — see _skip_persistent_context_cache).
-    cached = get_cached_context_length(model, base_url) if base_url and not is_bedrock_context and not _skip_persistent_context_cache(base_url, provider) else None
+    # A Codex Responses route is keyed on its transport, not its host: behind a proxy
+    # (HERMES_CODEX_BASE_URL, model.base_url, custom api_mode: codex_responses) the URL looks
+    # generic while the window is still the Codex OAuth one (#116191).
+    codex_route = _is_codex_route(provider, base_url, custom_providers)
+    # 1. Persistent cache (LM Studio / Codex routes excluded — see _skip_persistent_context_cache).
+    cached = get_cached_context_length(model, base_url) if base_url and not is_bedrock_context and not codex_route and not _skip_persistent_context_cache(base_url, provider) else None
     validated = _validate_cached_context_length(model, base_url, cached, api_key=api_key) if cached is not None else None
     if validated is not None:
         return validated
@@ -2159,9 +2226,11 @@ def get_model_context_length(
                 save_context_length(model, base_url, ctx)
             return ctx
     # 2. Live /models for truly custom endpoints. Known providers skip this: their /models may
-    # report a provider-imposed limit (Copilot: 128k) rather than the window.
-    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        return _resolve_custom_endpoint_context_length(model, base_url, api_key, provider)
+    # report a provider-imposed limit (Copilot: 128k) rather than the window. The native
+    # openai-codex provider skips it too even on a proxy URL — step 5 runs its live catalog probe.
+    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url) and (provider or "").strip().lower() != "openai-codex":
+        resolve = _resolve_custom_codex_route_context_length if codex_route else _resolve_custom_endpoint_context_length
+        return resolve(model, base_url, api_key, provider)
     # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
     if provider == "anthropic" or (base_url and base_url_hostname(base_url) == "api.anthropic.com"):
         ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)

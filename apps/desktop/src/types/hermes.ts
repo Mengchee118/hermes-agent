@@ -221,8 +221,21 @@ export interface MemoryProviderConfig {
   name: string
 }
 
+/** Transport pinned on a custom endpoint; `''` = let the runtime auto-detect. Same
+ * choices as `hermes model`'s custom-provider setup (#93622). */
+export type CustomEndpointApiMode = '' | 'anthropic_messages' | 'chat_completions' | 'codex_responses'
+
+/** One `/v1/models` row; a gateway may advertise a reasoning alias
+ * (`gpt-5.6-sol-high` → `gpt-5.6-sol` @ `high`) that the bare id list flattens. */
+export interface CustomEndpointModelDetail {
+  canonical_model?: null | string
+  id: string
+  reasoning_effort?: null | string
+}
+
 export interface CustomEndpoint {
   api_key_preview?: null | string
+  api_mode?: CustomEndpointApiMode
   base_url: string
   context_length?: null | number
   discover_models: boolean
@@ -248,23 +261,29 @@ export interface CustomEndpointsResponse {
 
 export interface CustomEndpointUpdate {
   api_key?: string
+  api_mode?: CustomEndpointApiMode
   base_url: string
   context_length?: number
   discover_models?: boolean
   id?: string
   make_default?: boolean
   model: string
+  model_details?: CustomEndpointModelDetail[]
   models?: string[]
   name: string
 }
 
 export interface CustomEndpointValidationResponse {
   message: string
+  /** Older backends send only `models`. */
+  model_details?: CustomEndpointModelDetail[]
   models: string[]
   ok: boolean
   reachable: boolean
   // Base URL that actually served /models (the entered URL or its /v1 variant); persist this one.
   resolved_base_url?: string
+  /** The transport whose route the backend probed (pinned api_mode, or the runtime's URL auto-detect). */
+  transport_checked?: CustomEndpointApiMode
 }
 
 export interface MessagingEnvVarInfo {
@@ -738,6 +757,8 @@ export interface SessionRuntimeInfo {
   personality?: string
   provider?: string
   reasoning_effort?: string
+  /** What the route actually sends for `reasoning_effort` (empty when unset; equal when verbatim). */
+  reasoning_effort_wire?: string
   running?: boolean
   service_tier?: string
   skills?: Record<string, string[]> | string[]
@@ -1522,21 +1543,6 @@ export interface StaleAuxAssignment {
   model: string
 }
 
-export type CronModelDriftAxis = 'model' | 'provider'
-
-export interface CronModelImpactJob {
-  id: string
-  name: string
-  drifted_axes: CronModelDriftAxis[]
-}
-
-export interface CronModelImpact {
-  available: boolean
-  affected_count: number
-  truncated: boolean
-  jobs: CronModelImpactJob[]
-}
-
 /** One skill-hub source (official index, GitHub, skills.sh, …) as reported by
  *  `GET /api/skills/hub/sources`. */
 export interface SkillHubSource {
@@ -1705,8 +1711,6 @@ export interface ModelAssignmentResponse {
    *  switching the main provider to Nous. Empty unless provider === 'nous'
    *  and the user is a paid subscriber with unconfigured tools. */
   gateway_tools?: string[]
-  /** Additive profile-local cron impact returned after a persisted main assignment. */
-  cron_model_impact?: CronModelImpact
   confirm_message?: string
   confirm_required?: boolean
   model?: string

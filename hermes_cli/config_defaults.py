@@ -107,6 +107,12 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
+        # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
+        # overloaded/529, connect/read timeouts) with nothing delivered yet, wait and retry this many
+        # more cycles (jittered 15/30/60/60/60s; a provider Retry-After wins up to 120s) with a
+        # visible "retrying automatically" countdown instead of ending the turn. Esc/interrupt stops
+        # the wait; auth/format/billing/policy errors never enter. 0 disables.
+        "auto_recovery_cycles": 5,
         # Seconds the Codex/Responses stream may keep reading after its terminal frame so the relay
         # finalizer can run. Relays that never close the SSE socket after response.completed would
         # otherwise wedge the turn until the idle watchdog discards the already-billed response
@@ -125,6 +131,9 @@ DEFAULT_CONFIG = {
         # turn), "cold" (first turn of a session only).
         "service_tier": "",
         "fast_auto_seconds": 60,
+        # Responses API final-answer length (`text.verbosity`): "" = not sent (provider default),
+        # or low | medium | high. Responses-family transports only; chat_completions never sends it.
+        "text_verbosity": "",
         # System-prompt guidance telling the model to call tools instead of describing actions.
         # "auto" = gpt/codex models; true/false = force for all models; or a list of model-name
         # substrings (e.g. ["gpt", "codex", "gemini", "qwen"]).
@@ -921,7 +930,9 @@ DEFAULT_CONFIG = {
         # Per-platform: display.platforms.<platform>.runtime_footer.
         "runtime_footer": {
             "enabled": False,
-            "fields": ["model", "context_pct", "cwd"],  # order shown; drop any to hide
+            # order shown; drop any to hide. Opt-in extras: latency, served_model (alias → the
+            # deployment a routing proxy reported / Hermes' fallback route).
+            "fields": ["model", "context_pct", "cwd"],
         },
         # CLI/TUI status bar fields. Non-empty = only listed fields show (built-in order kept,
         # config controls visibility not ordering); empty = default set. Available: model,
@@ -1029,6 +1040,11 @@ DEFAULT_CONFIG = {
         # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" |
         # "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
+        "streaming": {
+            # Shortest first sentence (chars) spoken on its own by streaming TTS; shorter openers
+            # ride with the next sentence. 20 suits English; CJK voice setups use ~6.
+            "min_len": 20,
+        },
         "edge": {
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
             "voice": "en-US-AriaNeural",
@@ -1045,6 +1061,9 @@ DEFAULT_CONFIG = {
             # Forwarded verbatim in the request body for OpenAI-compatible servers whose cloned
             # voices demand it (400 consent_required otherwise); "" sends nothing.
             "consent_attestation": "",
+            # Raw PCM rate for streaming playback. OpenAI emits 24 kHz; a compatible endpoint that
+            # reports its rate (X-Audio-Sample-Rate header) overrides this automatically.
+            "pcm_sample_rate": 24000,
         },
         "gemini": {
             "model": "gemini-2.5-flash-preview-tts",
@@ -1675,6 +1694,13 @@ DEFAULT_CONFIG = {
         # its own logins (`hermes auth add <provider>`). `hermes auth add openai-codex` still offers the import
         # interactively.
         "adopt_external_logins": True,
+        # How `hermes auth add openai-codex` / `hermes model` sign in to OpenAI Codex.
+        # "device_code" (default): open a URL, enter a code. "browser": authorization-code + PKCE on
+        # the loopback listener http://localhost:1455/auth/callback (the redirect OpenAI registered
+        # for the Codex client) — for organizations that disable the device-code grant. Falls back
+        # to device code when that port is busy. `hermes auth add openai-codex --browser` opts in
+        # for one login without changing this key.
+        "codex_login_flow": "device_code",
     },
     "security": {  # Security: pre-exec scanning via tirith plus related guards.
         "allow_private_urls": False,  # allow requests to private/internal IPs (OpenWrt, VPNs)
@@ -1724,9 +1750,8 @@ DEFAULT_CONFIG = {
         # False = fail during the run instead.
         "preflight": True,
         # Default model for cron jobs (WHAT model runs). Fire-time resolution: per-job pin >
-        # cron.model > the job's creation-time snapshot > model.default. An unpinned job keeps
-        # running on the model it was created under when model.default later changes; cron.model
-        # is the way to move the whole fleet at once. "" = fall through.
+        # cron.model > model.default (the main agent model). An unpinned job follows the main
+        # model on every run; cron.model decouples the whole fleet from chat. "" = fall through.
         "model": "",
         # Inference provider paired with cron.model (NOT the scheduler provider below). "" = resolve
         # from global config.
@@ -1898,16 +1923,17 @@ DEFAULT_CONFIG = {
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
     },
-    # Tool Search: deferrable (MCP / non-core plugin) tools are replaced in the model-facing array
-    # by tool_search / tool_describe / tool_call bridges and surfaced on demand. Core Hermes tools
-    # (terminal, file tools, todo, memory, browser_*, ...) are NEVER deferred.
+    # Tool Search replaces deferred tools in the model-facing array with the
+    # tool_search / tool_describe / tool_call bridges and surfaces them on demand.
+    # Working-set core tools stay eager, while the explicit ``defer`` list below
+    # may include cold, event-triggered built-ins as well as plugin/MCP tools.
     "tools": {
         "tool_search": {
-            # Tiered: tier 0 (no deferrable tools) = everything eager; tier 1 = bridge + a
+            # Tiered: tier 0 (no deferred tools) = everything eager; tier 1 = bridge + a
             # name+description manifest when it fits the budget (degrades to names-only); tier 2
             # (over budget even names-only, e.g. ~3,300-tool APIs) = bare bridge + a
             # one-line-per-server summary (name + tool count). "auto"|"on" = activate when at least
-            # one deferrable tool exists ("auto" is an alias of "on" today, reserved for a future
+            # one deferred tool exists ("auto" is an alias of "on" today, reserved for a future
             # budget-gated mode; keep it the default so explicit "on"/"off" pins are unaffected).
             # "off" = pass-through, no bridge.
             "enabled": "auto",
@@ -1926,6 +1952,17 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,
+            # Tools replaced by the bridge by default. This list intentionally includes cold,
+            # event-triggered built-ins; an explicit list replaces it wholesale and [] keeps every
+            # tool eager. The runtime fallback in tools/tool_search.py derives from this value.
+            "defer": [
+                "computer_use", "session_search", "image_generate",
+                "todo_list", "process_manage", "cronjob_manage",
+                # Desktop GUI surface (desktop_ui + project toolsets)
+                "drive_preview", "gui_tour", "desktop_preview", "annotate_preview",
+                "show_tip", "desktop_project", "close_terminal",
+                "apply_layout", "read_terminal", "read_window_below", "focus_pane",
+            ],
         },
         # Remote connector discovery/lifecycle through the Nous tool gateway.
         # The flag is the user's off switch; availability additionally requires
@@ -2123,6 +2160,12 @@ DEFAULT_CONFIG = {
             # /v1/runs beyond this get HTTP 429 + Retry-After, bounding CPU/memory/LLM-quota
             # exhaustion from a request flood. 0 = no cap.
             "max_concurrent_runs": 10,
+            # Cap (chars) on each tool output and tool-call argument string in the stored
+            # /v1/responses conversation history used for previous_response_id chaining. The
+            # stored history is cumulative, so a few large tool outputs can make one
+            # response_store.db write several hundred KB. 0 = store tool outputs verbatim
+            # (default: the capped text is what the model is replayed on the next turn).
+            "history_tool_output_max_chars": 0,
         },
     },
     # Real-time token streaming to messaging platforms (gateway; restart after enabling). Off by

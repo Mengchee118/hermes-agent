@@ -732,6 +732,39 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
     )
 
 
+def _turn_author(agent: Any) -> Dict[str, Any]:
+    """This turn's normalized author dict, ``{}`` when the turn carried none."""
+    author = getattr(agent, "_turn_author", None)
+    return author if isinstance(author, dict) else {}
+
+
+def _turn_author_field(agent: Any, key: str) -> str:
+    value = _turn_author(agent).get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def attribution_sender_id(agent: Any) -> str:
+    """Who wrote THIS turn's user message, for attribution only. "" when unknown.
+
+    Prefers the per-turn author id (``agent._turn_author``, which ``build_turn_context``
+    re-derives from the caller's ``turn_author`` on every turn and resets to None when the
+    turn carries no author) over ``agent._user_id``, which is fixed at agent construction
+    and is therefore wrong on a cached agent that serves several senders — the API server's
+    /v1/runs and session-stream surfaces reuse one agent across callers and never set
+    ``_user_id`` at all.
+
+    Deliberately NOT written back onto ``_user_id``: that attribute feeds the session-row
+    identity (``run_agent.py``: create_session ``user_id``, ``_gateway_origin_json``) and
+    memory-provider scoping, so per-turn mutation would rewrite conversation ownership.
+    This value is a label; it grants nothing. Tool authorization, gateway allowlists and
+    browser/control principals do not read it.
+    """
+    author_id = _turn_author_field(agent, "id")
+    if author_id:
+        return author_id
+    return getattr(agent, "_user_id", None) or ""
+
+
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: List[Any], conversation_history: Optional[List[Any]],
@@ -754,7 +787,13 @@ def _collect_pre_llm_call_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
+            # Per-turn author when the caller supplied one (API ``body.author``, dispatcher
+            # HERMES_TURN_AUTHOR), else the construction-time gateway user. Attribution only.
+            sender_id=attribution_sender_id(agent),
+            # Author name for the same turn, "" when unknown. Attribution only.
+            sender_name=_turn_author_field(agent, "name"),
+            # True only when the turn's author is flagged as a bot by the transport.
+            sender_is_bot=bool(_turn_author(agent).get("is_bot")),
             # Gateway route metadata (additive, "" outside a gateway). These are the
             # values the gateway passed at agent construction, so a plugin can tell
             # which chat / forum topic a turn came from. session_id above is an opaque

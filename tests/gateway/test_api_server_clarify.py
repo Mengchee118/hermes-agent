@@ -221,8 +221,18 @@ async def test_run_clarify_registry_endpoint_round_trip(adapter, monkeypatch, ou
             assert response.status == 202
             run_id = json.loads(response.text)["run_id"]
             task = adapter._active_run_tasks[run_id]
-            queue = adapter._run_streams[run_id]
-            event = await asyncio.wait_for(queue.get(), 10)
+            # Upstream fans run events out via _RunStream: subscribe like an SSE client.
+            queue, replay = adapter._run_streams[run_id].attach()
+            pending = [event for _, event in replay]
+
+            async def next_event():
+                if pending:
+                    return pending.pop(0)
+                return (await queue.get())[1]
+
+            event = await asyncio.wait_for(next_event(), 10)
+            while event and event["event"] != "clarify.request":
+                event = await asyncio.wait_for(next_event(), 10)
             assert event["event"] == "clarify.request"
             cid = event["clarify_id"]
             assert event["multi_select"] is True
@@ -247,9 +257,9 @@ async def test_run_clarify_registry_endpoint_round_trip(adapter, monkeypatch, ou
             else:
                 await asyncio.wait_for(asyncio.shield(task), 10)
             assert await asyncio.to_thread(finished.wait, 10)
-            events = []
+            events = list(pending)
             while not queue.empty():
-                events.append(queue.get_nowait())
+                events.append(queue.get_nowait()[1])
             assert any(e and e["event"] == "clarify.retired" and e["clarify_id"] == cid for e in events)
             assert cid not in clarify._entries
             response = await client.post(f"/v1/runs/{run_id}/clarify", headers=headers,

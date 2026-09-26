@@ -2509,9 +2509,10 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
+    same-directory file), then the checkout launcher when the running
+    interpreter was handed an injected checkout-only sys.path, then the
+    interpreter's ``-m hermes_cli.main`` when child imports are inherited
+    (also covers shim-less cron, systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
     search, batch shims fall back to the module form) only when ``hermes_cli``
     is not importable. The module argv must win over PATH: a PATH-first lookup
     lets an attacker-planted ``hermes`` shadow the running install (#111569).
@@ -2529,6 +2530,16 @@ def _resolve_hermes_argv() -> list[str]:
         if resolved_env_bin:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
+
+    # The bundled Python launcher may insert this checkout into sys.path only
+    # in the parent process. `find_spec` then succeeds here, but a fresh
+    # `python -m hermes_cli.main` worker cannot import hermes_cli. Prefer the
+    # checkout's own executable, which reinjects the path for each worker.
+    checkout = Path(__file__).resolve().parents[1]
+    launcher = checkout / '.hermes' / 'bin' / 'hermes'
+    if (sys.path and Path(sys.path[0]).resolve() == checkout
+            and launcher.is_file() and os.access(launcher, os.X_OK)):
+        return _hermes_path_argv(str(launcher))
 
     try:
         if importlib.util.find_spec("hermes_cli") is not None:

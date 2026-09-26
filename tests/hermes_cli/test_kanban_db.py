@@ -1575,18 +1575,36 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
-    """A `hermes` on PATH must not shadow the running install (#111569):
-    the module argv wins whenever ``hermes_cli`` is importable; only an
-    explicit ``$HERMES_BIN`` overrides it."""
+def test_resolve_hermes_argv_injected_checkout_uses_launcher(monkeypatch):
+    """A parent-only sys.path insertion must not produce an unrunnable -m child."""
+    import sys
+    from pathlib import Path
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    checkout = Path(kbd.__file__).resolve().parents[1]
+    launcher = checkout / '.hermes' / 'bin' / 'hermes'
+    if not launcher.is_file():
+        pytest.skip('source checkout has no bundled launcher')
+    monkeypatch.delenv('HERMES_BIN', raising=False)
+    monkeypatch.setattr(sys, 'path', [str(checkout), *sys.path])
+    assert kbd._resolve_hermes_argv() == [str(launcher)]
+    result = subprocess.run([str(launcher), '--version'], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr[:200]
+
+
+def test_resolve_hermes_argv_ignores_path_shim(monkeypatch):
+    """An attacker-planted PATH shim must not shadow this checkout (#111569)."""
     import shutil
     import sys
+    from pathlib import Path
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(sys, 'path', [str(Path(kbd.__file__).resolve().parents[1]), *sys.path])
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    launcher = Path(kbd.__file__).resolve().parents[1] / '.hermes' / 'bin' / 'hermes'
+    assert kbd._resolve_hermes_argv() == [str(launcher)]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]

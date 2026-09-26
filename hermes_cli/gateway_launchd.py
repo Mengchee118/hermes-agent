@@ -352,6 +352,11 @@ def generate_launchd_plist() -> str:
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
+    # A bundled interpreter gets the checkout only via its launcher. Worker
+    # subprocesses need the same executable, not a bare python -m invocation.
+    checkout_launcher = _gw().get_hermes_home() / 'hermes-agent' / '.hermes' / 'bin' / 'hermes'
+    worker_bin_xml = (f'\n        <key>HERMES_BIN</key>\n        <string>{escape(str(checkout_launcher))}</string>'
+                      if checkout_launcher.is_file() else '')
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = _gw().get_launchd_label()
@@ -408,7 +413,7 @@ def generate_launchd_plist() -> str:
         <string>{sane_path}</string>
 
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{hermes_home}</string>{worker_bin_xml}
         <key>HERMES_SUPERVISED_CHILD</key>
         <string>1</string>
     </dict>

@@ -153,6 +153,44 @@ def test_old_server_does_not_unlink_replacement_socket_or_pointer(home: Path):
     _run(scenario())
 
 
+def test_new_server_does_not_unlink_live_predecessor_socket(home: Path):
+    async def scenario():
+        old = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 101}})
+        new = GatewayControlServer(home)
+        assert await old.start()
+        socket_path = old._bind_path
+        original_inode = socket_path.stat().st_ino
+        try:
+            assert await new.start() is False
+            assert socket_path.stat().st_ino == original_inode
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            writer.write(b'{"verb":"identify"}\n')
+            await writer.drain()
+            response = await reader.readline()
+            writer.close()
+            await writer.wait_closed()
+            assert response  # predecessor still serves real connections
+        finally:
+            await new.stop()
+            await old.stop()
+    _run(scenario())
+
+
+def test_new_server_replaces_stale_socket(home: Path):
+    async def scenario():
+        stale_path, _ = resolve_server_socket_path(home)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(stale_path))
+        stale.close()  # socket path remains, but no process listens
+        server = GatewayControlServer(home)
+        assert await server.start()
+        try:
+            assert stale_path.exists()
+        finally:
+            await server.stop()
+    _run(scenario())
+
+
 def test_unknown_verb_and_malformed_request(home: Path):
     async def scenario():
         server = GatewayControlServer(

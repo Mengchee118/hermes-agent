@@ -134,6 +134,8 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
+        self._bound_identity: Optional[tuple[int, int]] = None
+        self._pointer_identity: Optional[tuple[int, int]] = None
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
 
@@ -161,9 +163,13 @@ class GatewayControlServer:
         with contextlib.suppress(OSError):
             os.chmod(bind_path, 0o600)
         self._bind_path = bind_path
+        bound_stat = bind_path.stat()
+        self._bound_identity = (bound_stat.st_dev, bound_stat.st_ino)
         if pointer_file is not None:
             pointer_file.write_text(str(bind_path), encoding="utf-8")
             self._pointer_file = pointer_file
+            pointer_stat = pointer_file.stat()
+            self._pointer_identity = (pointer_stat.st_dev, pointer_stat.st_ino)
         logger.info("Gateway control socket listening at %s", bind_path)
         return True
 
@@ -193,10 +199,15 @@ class GatewayControlServer:
         self.cleanup_files()
 
     def cleanup_files(self) -> None:
-        """Best-effort removal of socket + pointer files (atexit-safe)."""
-        for path in filter(None, (self._bind_path, self._pointer_file)):
+        """Only unlink files this server bound; a newer owner may reuse the path while we drain."""
+        for path, identity in ((self._bind_path, self._bound_identity),
+                               (self._pointer_file, self._pointer_identity)):
+            if path is None or identity is None:
+                continue
             with contextlib.suppress(OSError):
-                path.unlink(missing_ok=True)
+                current = path.stat()
+                if (current.st_dev, current.st_ino) == identity:
+                    path.unlink()
 
     def handle_request_line(self, raw: bytes) -> bytes:
         """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""

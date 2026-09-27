@@ -188,6 +188,34 @@ def test_process_record_is_built_before_the_listener_opens(home: Path, monkeypat
     assert order[:2] == ["pid_record", "listener"], order
 
 
+def test_old_server_does_not_unlink_replacement_socket_or_pointer(home: Path):
+    """A new owner may bind while the previous gateway is still draining."""
+    async def scenario():
+        old = GatewayControlServer(home)
+        assert await old.start()
+        socket_path = old._bind_path
+        pointer = old._pointer_file
+        if pointer is not None:
+            pointer.write_text(str(socket_path))
+        # Simulate the replacement owner swapping the pathname before old.stop().
+        socket_path.unlink()
+        replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        replacement.bind(str(socket_path))
+        replacement_inode = socket_path.stat().st_ino
+        try:
+            if pointer is not None:
+                pointer.unlink()
+                pointer.write_text(str(socket_path))
+            await old.stop()
+            assert socket_path.stat().st_ino == replacement_inode
+            if pointer is not None:
+                assert pointer.exists()
+        finally:
+            replacement.close()
+            socket_path.unlink(missing_ok=True)
+    _run(scenario())
+
+
 def test_unknown_verb_and_malformed_request(home: Path):
     async def scenario():
         server = GatewayControlServer(

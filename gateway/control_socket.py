@@ -215,19 +215,58 @@ class GatewayControlServer:
             with contextlib.suppress(FileExistsError):
                 bind_path.parent.mkdir(mode=0o700)
             if not _private_directory(bind_path.parent):
-                # Another local user pre-created the predictable shared-temp name; bootstrap treats
-                # a missing listener as fatal, so move to an unpredictable private root instead.
                 logger.warning("Fallback control directory %s is not private; using a fresh one", bind_path.parent)
                 bind_path = _squat_proof_fallback(bind_path)
                 self._fallback_root = bind_path.parent.parent
         if bind_path.is_symlink():
             raise PermissionError("control socket cannot be a symlink")
-        # We only get here after winning the PID-file O_EXCL race, so any existing
-        # file is stale or a collision — never a live sibling.
+        # A second gateway can overlap this one; never unlink a live listener.
         if bind_path.exists():
-            if bind_path.lstat().st_uid != os.getuid():  # windows-footgun: ok — POSIX listener
+            if bind_path.lstat().st_uid != os.getuid():
                 raise PermissionError("control socket belongs to another user")
-            bind_path.unlink()
+            # A crash can leave an old regular file at this dedicated socket
+            # path. Remove it only when it is still the same non-symlink file.
+            if not bind_path.is_socket():
+                if bind_path.is_symlink() or not bind_path.is_file():
+                    logger.warning("Gateway control path is not a socket: %s", bind_path)
+                    return False
+                try:
+                    stale_stat = bind_path.stat()
+                    if (bind_path.stat().st_dev, bind_path.stat().st_ino) != (stale_stat.st_dev, stale_stat.st_ino):
+                        return False
+                    bind_path.unlink()
+                except OSError:
+                    return False
+            else:
+                try:
+                    before_stat = bind_path.stat()
+                    before_identity = (before_stat.st_dev, before_stat.st_ino)
+                except OSError:
+                    return False
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_unix_connection(str(bind_path)), timeout=0.5)
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass  # a stale socket left by a process that already exited
+                except (OSError, asyncio.TimeoutError) as exc:
+                    logger.warning("Cannot prove gateway control socket is stale at %s: %s", bind_path, exc)
+                    return False
+                else:
+                    writer.close()
+                    await writer.wait_closed()
+                    logger.warning("Gateway control socket already has a live owner at %s", bind_path)
+                    return False
+                # The path may have been replaced while we probed it.
+                if bind_path.exists():
+                    try:
+                        stale_stat = bind_path.stat()
+                        if not bind_path.is_socket():
+                            return False
+                        if (stale_stat.st_dev, stale_stat.st_ino) != before_identity:
+                            return False
+                        bind_path.unlink()
+                    except OSError:
+                        return False
         # Restrictive umask so the socket is never world-connectable, even for the instant before chmod.
         old_umask = os.umask(0o177)
         try:

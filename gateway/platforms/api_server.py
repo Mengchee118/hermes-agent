@@ -949,6 +949,7 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        self._persist_active_work()
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
@@ -962,6 +963,7 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        adapter._persist_active_work()
 
 
 def _require_auth(handler):
@@ -981,6 +983,7 @@ def _reserve_pending_api_work(adapter):
     the reservation to a task whose done callback then owns release."""
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
+    adapter._persist_active_work()
     try:
         yield reservation
     finally:
@@ -1245,6 +1248,7 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
         # gateway.api_server.max_concurrent_runs; 0 disables the cap.
         # Bounds CPU / memory / upstream-LLM-quota exhaustion from a request flood (#7483).
         self._inflight_agent_runs: int = 0
+        self._orphaned_api_workers: int = 0  # cancelled handlers whose executor turn is still live
         # Every agent inside _run_agent() for shutdown interrupt, keyed by id() (the strong ref
         # keeps the id() from recycling); distinct from the run_id-keyed _active_run_agents.
         self._shutdown_interruptible_agents: Dict[int, Any] = {}
@@ -1276,9 +1280,24 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
         try:
             return (int(getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
+                    + int(self._orphaned_api_workers)
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
             return 0
+
+    def _persist_active_work(self) -> None:
+        """LOCAL PATCH (2026-09-27): publish API work transitions to the shared runtime status.
+
+        The status socket and HTTP status both read the persisted file. Native turns already
+        publish their transitions, but API turns could leave a native-turn snapshot stuck busy.
+        This callback is optional for standalone adapters and must never interrupt a turn.
+        """
+        try:
+            persist = getattr(self.gateway_runner, "_persist_active_agents", None)
+            if callable(persist):
+                persist()
+        except Exception:
+            logger.debug("[api_server] could not publish active work", exc_info=True)
 
     def interrupt_active_runs(self, reason: str) -> int:
         """Interrupt every adapter-owned agent during shutdown (they are not in
@@ -4351,17 +4370,34 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
-        self._activate_admitted_request()
         self._inflight_agent_runs += 1
+        self._activate_admitted_request()
+        self._persist_active_work()
         started_at = time.perf_counter()
         usage: Optional[Dict[str, Any]] = None
+        worker_finished = False
+        handler_cancelled = False
+
+        def _worker_finished():
+            nonlocal worker_finished
+            worker_finished = True
+            if handler_cancelled:
+                self._orphaned_api_workers -= 1
+                self._persist_active_work()
+
         try:
 # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
-            result, usage = await _api_runs._submit_api_worker(loop, _run)
+            result, usage = await _api_runs._submit_api_worker(loop, _run, on_finished=_worker_finished)
             return result, usage
         finally:
+            # A cancelled handler cannot cancel its executor thread. Keep that thread
+            # counted until its own finally publishes completion (never report false SAFE).
+            if not worker_finished and asyncio.current_task().cancelling():
+                handler_cancelled = True
+                self._orphaned_api_workers += 1
             self._inflight_agent_runs -= 1
+            self._persist_active_work()
             if usage is not None:
                 self._record_api_metrics(usage, time.perf_counter() - started_at)
 

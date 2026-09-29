@@ -89,7 +89,7 @@ async def on_turn_executor(fn, /, *args, **kwargs):
     return await asyncio.get_running_loop().run_in_executor(api_turn_executor(), call)
 
 
-def _submit_api_worker(loop, fn):
+def _submit_api_worker(loop, fn, *, on_finished=None):
     """``loop.run_in_executor(api_turn_executor(), fn)`` with the worker-lifetime count held for the submission.
 
     Increment on the submitting (handler) thread so the count is live before the worker can
@@ -109,6 +109,12 @@ def _submit_api_worker(loop, fn):
             global _API_WORKER_LIVE
             with _API_WORKER_LOCK:
                 _API_WORKER_LIVE -= 1
+            if on_finished is not None:
+                try:
+                    loop.call_soon_threadsafe(on_finished)
+                except RuntimeError:
+                    # Loop already closed during shutdown; never replace the worker result.
+                    pass
 
     try:
         return loop.run_in_executor(api_turn_executor(), _counted)
@@ -894,6 +900,14 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
     else:
         task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    # Transfer only after the task exists: the live-owner admission above can await, and
+    # retiring the reservation early would publish idle while the work is still admitted.
+    self._activate_admitted_request()
+    # LOCAL PATCH (2026-09-27): /v1/runs work is counted while its task is live.
+    # Its own finally is too early (task.done() is still false); publish again
+    # from the done callback so the persisted status returns to idle.
+    self._persist_active_work()
+    task.add_done_callback(lambda _task: self._persist_active_work())
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):

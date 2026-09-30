@@ -758,6 +758,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
     else:
         task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    self._active_run_profiles[run_id] = launch.request_profile or "default"
     # Transfer only after the task exists: the live-owner admission above can await, and
     # retiring the reservation early would publish idle while the work is still admitted.
     self._activate_admitted_request()
@@ -765,7 +766,10 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # Its own finally is too early (task.done() is still false); publish again
     # from the done callback so the persisted status returns to idle.
     self._persist_active_work()
-    task.add_done_callback(lambda _task: self._persist_active_work())
+    def _finished(_task):
+        self._active_run_profiles.pop(run_id, None)
+        self._persist_active_work()
+    task.add_done_callback(_finished)
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):

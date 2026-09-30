@@ -197,6 +197,49 @@ class GatewayShutdownMixin:
             + self._active_deferred_agent_worker_count()
         )
 
+    def _active_by_profile(self) -> dict[str, int]:
+        """Attribute the same live units as ``_active_work_count`` without persisting a second counter.
+
+        Refuse an incomplete snapshot: callers must retain host-wide BUSY when
+        a new kind of work cannot be assigned safely.
+        """
+        from collections import Counter
+        from pathlib import Path
+        from hermes_constants import get_hermes_home
+        from gateway.session import profile_from_session_key_namespace
+
+
+        def from_home(home):
+            path = Path(home).resolve()
+            root = Path(get_hermes_home()).resolve()
+            if path == root:
+                return "default"
+            if path.parent == root / "profiles":
+                return path.name
+            raise ValueError(f"work from unknown profile home: {path}")
+
+        names = self.served_profile_names()
+        counts = Counter({name: 0 for name in names})
+        for key, _agent in self._running_agent_items():
+            parts = str(key).split(":", 2)
+            if len(parts) < 2 or parts[0] != "agent":
+                raise ValueError("running turn has no profile namespace")
+            counts[profile_from_session_key_namespace(parts[1])] += 1
+        from cron.scheduler import get_running_job_details
+        for job in get_running_job_details():
+            counts[from_home(job["home"])] += 1
+        adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+        if adapter is not None:
+            for name, count in adapter.active_agent_work_by_profile().items():
+                counts[name] += count
+        workers = getattr(self, "_deferred_agent_workers", None) or {}
+        for future in list(workers):
+            if not future.done():
+                counts[self._deferred_worker_profiles[future]] += 1
+        if set(counts) - set(names) or sum(counts.values()) != self._active_work_count():
+            raise ValueError("per-profile work does not match the host total")
+        return dict(counts)
+
     @staticmethod
     def _running_cron_job_count() -> int:
         # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread
@@ -283,9 +326,17 @@ class GatewayShutdownMixin:
         if workers is None:
             workers = self._deferred_agent_workers = {}
         workers[future] = agent
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
+        profiles = getattr(self, "_deferred_worker_profiles", None)
+        if profiles is None:
+            profiles = self._deferred_worker_profiles = {}
+        home = Path(get_hermes_home()).resolve()
+        profiles[future] = home.name if home.parent.name == "profiles" else "default"
 
         def _discard_worker(done_future: asyncio.Future) -> None:
             workers.pop(done_future, None)
+            profiles.pop(done_future, None)
             # Workers that outlive their starting coroutine have no later waiter: consume the
             # terminal exception so asyncio emits no unhandled-future warning.
             # See #98973.

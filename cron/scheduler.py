@@ -707,7 +707,7 @@ def get_running_job_details() -> list[dict]:
     now = time.time()
     with _running_lock:
         return [
-            {"job_id": key[1],
+            {"job_id": key[1], "home": key[0],
              "elapsed_s": round(now - _running_since[key], 1) if key in _running_since else None,
              "worker_pid": _running_worker_pids.get(key),
              "restart_safe": key in _scope_isolated_job_ids}

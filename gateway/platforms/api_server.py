@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -946,9 +947,10 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
+        reservation = {"active": True, "profile": _api_request_profile.get() or "default"}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        self._pending_by_profile[reservation["profile"]] += 1
         self._persist_active_work()
         try:
             return await handler(self, request, *args, **kwargs)
@@ -963,6 +965,10 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        profile = reservation.get("profile", "default")
+        adapter._pending_by_profile[profile] -= 1
+        if not adapter._pending_by_profile[profile]:
+            del adapter._pending_by_profile[profile]
         adapter._persist_active_work()
 
 
@@ -981,8 +987,10 @@ def _require_auth(handler):
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits; a handler may detach
     the reservation to a task whose done callback then owns release."""
-    reservation = {"active": True, "detached": False}
+    reservation = {"active": True, "detached": False,
+                   "profile": _api_request_profile.get() or "default"}
     adapter._pending_agent_requests += 1
+    adapter._pending_by_profile[reservation["profile"]] += 1
     adapter._persist_active_work()
     try:
         yield reservation
@@ -1249,6 +1257,10 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
         # Bounds CPU / memory / upstream-LLM-quota exhaustion from a request flood (#7483).
         self._inflight_agent_runs: int = 0
         self._orphaned_api_workers: int = 0  # cancelled handlers whose executor turn is still live
+        self._pending_by_profile = Counter()
+        self._inflight_by_profile = Counter()
+        self._orphaned_by_profile = Counter()
+        self._active_run_profiles: Dict[str, str] = {}
         # Every agent inside _run_agent() for shutdown interrupt, keyed by id() (the strong ref
         # keeps the id() from recycling); distinct from the run_id-keyed _active_run_agents.
         self._shutdown_interruptible_agents: Dict[int, Any] = {}
@@ -1284,6 +1296,23 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
             return 0
+
+    def active_agent_work_by_profile(self) -> dict[str, int]:
+        """Live profile ownership for exactly the work counted above.
+
+        A mismatch means an uninstrumented path: the socket omits attribution
+        rather than silently making one profile look idle.
+        """
+        counts = self._pending_by_profile + self._inflight_by_profile + self._orphaned_by_profile
+        for run_id, task in list(self._active_run_tasks.items()):
+            if not task.done():
+                profile = self._active_run_profiles.get(run_id)
+                if not profile:
+                    raise ValueError("live API run has no owning profile")
+                counts[profile] += 1
+        if sum(counts.values()) != self.active_agent_work_count():
+            raise ValueError("API work attribution does not match host total")
+        return dict(counts)
 
     def _persist_active_work(self) -> None:
         """LOCAL PATCH (2026-09-27): publish API work transitions to the shared runtime status.
@@ -4370,7 +4399,9 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
+        work_profile = _api_request_profile.get() or "default"
         self._inflight_agent_runs += 1
+        self._inflight_by_profile[work_profile] += 1
         self._activate_admitted_request()
         self._persist_active_work()
         started_at = time.perf_counter()
@@ -4383,6 +4414,7 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
             worker_finished = True
             if handler_cancelled:
                 self._orphaned_api_workers -= 1
+                self._orphaned_by_profile[work_profile] -= 1
                 self._persist_active_work()
 
         try:
@@ -4396,7 +4428,9 @@ class APIServerAdapter(APIClarifyMixin, OpenAICompatRoutesMixin, BasePlatformAda
             if not worker_finished and asyncio.current_task().cancelling():
                 handler_cancelled = True
                 self._orphaned_api_workers += 1
+                self._orphaned_by_profile[work_profile] += 1
             self._inflight_agent_runs -= 1
+            self._inflight_by_profile[work_profile] -= 1
             self._persist_active_work()
             if usage is not None:
                 self._record_api_metrics(usage, time.perf_counter() - started_at)

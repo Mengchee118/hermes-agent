@@ -288,6 +288,16 @@ async def _start_gateway_start_control_socket(runner):
             payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
                 payload.get("supervisor"), payload.get("supervisor", "none"))
             return payload
+        def _live_status_handler() -> dict:
+            from gateway.control_socket import build_status_payload
+            payload = build_status_payload()
+            try:
+                payload['active_by_profile'] = runner._active_by_profile()
+                payload['active_agents'] = sum(payload['active_by_profile'].values())
+            except Exception:
+                logger.exception('Cannot attribute in-flight work to served profiles')
+            return payload
+
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -335,6 +345,7 @@ async def _start_gateway_start_control_socket(runner):
 
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
+                           "status": _live_status_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "unserve-profile": unserve_profile_verb(runner),

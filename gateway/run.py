@@ -5595,6 +5595,17 @@ async def _start_gateway_start_control_socket(runner):
         # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
+        def _live_status_handler() -> dict:
+            from gateway.control_socket import build_status_payload
+            payload = build_status_payload()
+            try:
+                payload["active_by_profile"] = runner._active_by_profile()
+                payload["active_agents"] = sum(payload["active_by_profile"].values())
+            except Exception:
+                # No partial map: an older/uncertain gateway keeps clients conservative.
+                logger.exception("Cannot attribute in-flight work to served profiles")
+            return payload
+
         def _pause_for_update_handler() -> dict:
             try:
                 from hermes_cli.gateway import _get_restart_drain_timeout
@@ -5633,7 +5644,8 @@ async def _start_gateway_start_control_socket(runner):
                 return {"multiplex": True, "pending": True, "served_profiles": runner.served_profile_names()}
 
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler,
+            verb_handlers={"status": _live_status_handler,
+                           "pause-for-update": _pause_for_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "unserve-profile": unserve_profile_verb(runner),
                            "serve-profile": serve_profile_verb(runner),

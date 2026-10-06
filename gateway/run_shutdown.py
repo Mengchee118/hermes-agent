@@ -191,11 +191,13 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     # Active-work accounting
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
+        from agent.background_review import active_background_reviews_by_home
         return (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + sum(active_background_reviews_by_home().values())
         )
 
     def _active_by_profile(self) -> dict[str, int]:
@@ -237,6 +239,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         for future in list(workers):
             if not future.done():
                 counts[self._deferred_worker_profiles[future]] += 1
+        from agent.background_review import active_background_reviews_by_home
+        for home, count in active_background_reviews_by_home().items():
+            counts[from_home(home)] += count
         if set(counts) - set(names) or sum(counts.values()) != self._active_work_count():
             raise ValueError("per-profile work does not match the host total")
         return dict(counts)
@@ -851,10 +856,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred, reviews)`` — live work the drain waits on."""
+        from agent.background_review import active_background_reviews_by_home
         return (
             self._running_agent_count(), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            sum(active_background_reviews_by_home().values()),
         )
 
     async def _drain_active_agents(
@@ -874,9 +881,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 last_counts, last_status_at = counts, now
 
         # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
-        _cron0, _api0, _deferred0 = last_counts[1:]
+        _cron0, _api0, _deferred0, _reviews0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not self._running_agents and not (_cron0 or _api0 or _deferred0 or _reviews0):
             return snapshot, False
         # Cron and api_server runs ride the cron floor: a chat turn is announced+resumable, but a killed
         # cron run is a permanent failure and a killed /v1 run fails a caller blocked on its result.
@@ -887,8 +894,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
         def _still_draining() -> bool:
             now = loop.time()
-            agents, cron, api, deferred = self._drain_work_counts()
-            return bool(((agents or deferred) and now < deadline) or ((cron or api) and now < cron_deadline))
+            agents, cron, api, deferred, reviews = self._drain_work_counts()
+            return bool(((agents or deferred) and now < deadline) or ((cron or api or reviews) and now < cron_deadline))
 
         # Both budgets at 0 = an expired deadline (loop unentered), so timed_out still comes from real state.
         while _still_draining():
@@ -1623,23 +1630,29 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         either way. Cron runs are counted per profile-scoped run by the scheduler, not by
         subtracting from the bare-ID active count: two profiles can run the same job ID, and one
         excluded run must not hide the other.
+        Post-reply reviews are neither wedged chat turns nor restart-safe cron
+        workers, so they remain in the restart wait.
         """
+        from agent.background_review import active_background_reviews_by_home
         non_cron = (
             self._running_agent_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + sum(active_background_reviews_by_home().values())
         )
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
             + self._restart_wait_cron_counts()["awaitable"]
         )
 
+
     def _describe_active_work(self) -> list:
         """One dict per in-flight work unit the restart wait is holding for, so an observer
         (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
 
-        ``kind`` ∈ ``chat`` (session turn), ``cron`` (job id + external worker pid when the run was
-        handed to a restart-safe scope), ``api`` / ``deferred`` (count only — those sources expose
+        ``kind`` ∈ ``chat`` (session turn), ``review`` (post-reply profile), ``cron``
+        (job id + external worker pid when the run was handed to a restart-safe
+        scope), ``api`` / ``deferred`` (count only — those sources expose
         no identity). Best-effort: a source that can't be read is omitted, never raises.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -1671,6 +1684,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                               "restart_safe": bool(job.get("restart_safe"))})
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
+        with suppress(Exception):
+            from agent.background_review import active_background_reviews_by_home
+            for home, count in active_background_reviews_by_home().items():
+                units.extend({"kind": "review", "home": home, "pid": os.getpid()} for _ in range(count))
         return units
 
     async def _await_active_work_before_restart(self) -> bool:

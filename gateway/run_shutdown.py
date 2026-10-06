@@ -208,6 +208,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
     # Active-work accounting
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
+        from agent.background_review import active_background_reviews_by_home
         return (
             self._running_agent_count()
             + managed_turn_count(self)
@@ -215,6 +216,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
             + _active_async_delegation_count()
+            + sum(active_background_reviews_by_home().values())
         )
 
     @staticmethod
@@ -819,11 +821,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred, delegations)`` the drain waits on; a managed-worker turn is a chat turn."""
+        """``(agents, cron, api, deferred, delegations)`` the drain waits on; a managed-worker turn is a chat turn.
+
+        LOCAL PATCH: post-reply reviews ride the delegations slot (same cron-floor deadline), so the
+        tuple keeps upstream's five slots."""
+        from agent.background_review import active_background_reviews_by_home
         return (
             self._running_agent_count() + managed_turn_count(self), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
-            _active_async_delegation_count(),
+            _active_async_delegation_count() + sum(active_background_reviews_by_home().values()),
         )
 
     async def _drain_active_agents(
@@ -858,6 +864,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             agents, cron, api, deferred, delegations = self._drain_work_counts()
             # A killed background delegation is a permanent loss of its result (recovered next boot only as
             # ``outcome unknown``), so it rides the cron floor like cron/api, not the interactive deadline.
+            # LOCAL PATCH: the delegations slot also carries post-reply reviews.
             return bool(((agents or deferred) and now < deadline)
                         or ((cron or api or delegations) and now < cron_deadline))
 
@@ -1545,12 +1552,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         either way. Cron runs are counted per profile-scoped run by the scheduler, not by
         subtracting from the bare-ID active count: two profiles can run the same job ID, and one
         excluded run must not hide the other.
+        Post-reply reviews are neither wedged chat turns nor restart-safe cron
+        workers, so they remain in the restart wait.
         """
+        from agent.background_review import active_background_reviews_by_home
         non_cron = (
             self._running_agent_count()
             + managed_turn_count(self)
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + sum(active_background_reviews_by_home().values())
         )
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
@@ -1558,13 +1569,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             + self._restart_wait_cron_counts()["awaitable"]
         )
 
+
     def _describe_active_work(self) -> list:
         """One dict per in-flight work unit the restart wait is holding for, so an observer
         (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
 
-        ``kind`` ∈ ``chat`` (session turn), ``cron`` (job id + external worker pid when the run was handed to a
-        restart-safe scope), ``managed`` (session + worker pid when a worker holds it), ``api`` / ``deferred``
-        (count only). Best-effort: a source that can't be read is omitted, never raises."""
+        ``kind`` is ``chat`` (session turn), ``review`` (post-reply profile), ``cron`` (job id + external
+        worker pid when the run was handed to a restart-safe scope), ``managed`` (session + worker pid
+        when a worker holds it), or ``api`` / ``deferred`` (count only).
+        Best-effort: a source that can't be read is omitted, never raises.
+        """
         from gateway.run import _AGENT_PENDING_SENTINEL
         now = time.time()
         units: list = []
@@ -1598,6 +1612,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         with suppress(Exception):
             from gateway.restart_when_idle import background_units
             units.extend(background_units(self))
+        with suppress(Exception):
+            from agent.background_review import active_background_reviews_by_home
+            for home, count in active_background_reviews_by_home().items():
+                units.extend({"kind": "review", "home": home, "pid": os.getpid()} for _ in range(count))
         return units
 
     async def _await_active_work_before_restart(self) -> bool:

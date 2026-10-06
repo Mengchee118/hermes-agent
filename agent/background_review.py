@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -61,6 +62,16 @@ def turn_waits_for_background_work(ends_wait: Callable[[], bool] = _never) -> It
         yield
     finally:
         _TURN_WAITS_FOR_BACKGROUND_WORK.reset(token)
+
+# Review threads outlive the foreground turn. Keep their own identity-keyed
+# registry so gateway status and drain can see the work until the request ends.
+_review_registry_lock = threading.Lock()
+_review_registry: Dict[_BackgroundReviewRun, str] = {}
+
+def active_background_reviews_by_home() -> Dict[str, int]:
+    """Live reviews by resolved profile home (including startup, excluding queued reviews)."""
+    with _review_registry_lock:
+        return dict(Counter(_review_registry.values()))
 
 
 class _BackgroundReviewRun:
@@ -122,6 +133,10 @@ def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
             if current is not None and not current.request_done.is_set():
                 return None
             agent._background_review_run = run
+            from hermes_constants import get_hermes_home
+            home = str(get_hermes_home().resolve())
+            with _review_registry_lock:
+                _review_registry[run] = home
     except (AttributeError, TypeError):
         return None
     return run
@@ -131,6 +146,8 @@ def finish_background_review_run(agent: Any, run: Optional[_BackgroundReviewRun]
     """Publish one run's request exit without clearing a successor (ABA-safe)."""
     if run is None or not run.mark_request_finished():
         return
+    with _review_registry_lock:
+        _review_registry.pop(run, None)
     with _optional_lock(agent, "_background_review_lock"):
         if getattr(agent, "_background_review_run", None) is run:
             agent._background_review_run = None
@@ -1382,6 +1399,7 @@ def _run_review_in_thread(
             getattr(agent, "provider", "?"),
         )
         _set_thread_approval_callback(None)
+        finish_background_review_run(agent, review_run)
         return
     st = _ReviewForkState()
     # The gateway's stop may close the parent's handle while the review runs: the fork records its usage through its

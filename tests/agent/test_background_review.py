@@ -430,6 +430,27 @@ def test_background_review_registers_before_start_runs_and_cleans_up(monkeypatch
     assert agent._active_children == []
 
 
+def test_background_review_thread_error_does_not_leave_gateway_busy(monkeypatch, tmp_path):
+    import pytest
+    import hermes_constants
+    from agent import background_review
+    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
+    monkeypatch.setattr(run_agent_module.threading, 'Thread', ImmediateThread)
+
+    def failing_worker(*args, **kwargs):
+        def fail():
+            raise RuntimeError('review worker failed')
+        return fail, 'prompt'
+
+    monkeypatch.setattr(background_review, 'spawn_background_review_thread', failing_worker)
+    agent = _bare_agent()
+    with pytest.raises(RuntimeError, match='review worker failed'):
+        agent._spawn_background_review_now([], review_skills=True)
+    assert background_review.active_background_reviews_by_home() == {}
+    assert agent._background_review_run is None
+    assert agent._active_children == []
+
+
 def test_background_review_snapshot_isolated_from_live_nested_messages():
     """A review must not mutate the persisted/live transcript through aliases."""
     original = [{

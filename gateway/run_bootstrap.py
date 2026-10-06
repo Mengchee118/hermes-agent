@@ -252,6 +252,24 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     return True
 
 
+def host_status_payload(runner) -> dict:
+    """LOCAL PATCH: the ``status`` verb answers ONE live host-level in-flight count.
+
+    The persisted runtime status is written only on turn transitions, so work that starts or
+    ends without one (post-reply background reviews) is invisible to a file read. One shared
+    gateway serves every profile and a restart stops all of them, so the ops busy check needs a
+    single host answer, not per-profile attribution. Falls back to the persisted count on error.
+    """
+    import logging
+    from gateway.control_socket import build_status_payload
+    payload = build_status_payload()
+    try:
+        payload["active_agents"] = int(runner._active_work_count())
+    except Exception:
+        logging.getLogger(__name__).exception("Cannot compute live in-flight work for status")
+    return payload
+
+
 async def _start_gateway_start_control_socket(runner):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
     from gateway.run import (asyncio, logger, os, threading)
@@ -290,6 +308,9 @@ async def _start_gateway_start_control_socket(runner):
             payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
                 payload.get("supervisor"), payload.get("supervisor", "none"))
             return payload
+        def _live_status_handler() -> dict:
+            return host_status_payload(runner)
+
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -337,6 +358,7 @@ async def _start_gateway_start_control_socket(runner):
 
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
+                           "status": _live_status_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "unserve-profile": unserve_profile_verb(runner),

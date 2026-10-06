@@ -615,7 +615,29 @@ def _looks_like_image(data: bytes) -> bool:
     """Return True if *data* starts with a known image magic-byte sequence."""
     return len(data) >= 4 and (data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff"
                or data[:6] in {b"GIF87a", b"GIF89a"} or data[:2] == b"BM"
-               or (data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP"))
+               or (data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP")
+               or (len(data) >= 12 and data[4:8] == b"ftyp" and
+                   data[8:12] in {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}))
+
+
+def is_local_heic_path(url_or_path: str) -> bool:
+    """Check a cached local file's HEIC header, not its untrusted name or MIME."""
+    from urllib.parse import unquote, urlsplit
+    raw = str(url_or_path)
+    if raw.startswith("file://"):
+        parsed = urlsplit(raw)
+        if parsed.netloc not in ("", "localhost"):
+            return False
+        raw = unquote(parsed.path)
+    elif not raw.startswith("/"):
+        return False
+    try:
+        with Path(raw).open("rb") as f:
+            header = f.read(12)
+        return (len(header) == 12 and header[4:8] == b"ftyp" and
+                header[8:12] in {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"})
+    except OSError:
+        return False
 
 
 def _secure_media_cache_dir(cache_dir: Path) -> None:

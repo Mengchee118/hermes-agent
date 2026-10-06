@@ -5598,11 +5598,16 @@ async def _start_gateway_start_control_socket(runner):
         def _live_status_handler() -> dict:
             from gateway.control_socket import build_status_payload
             payload = build_status_payload()
+            # The persisted status file is a turn-boundary snapshot. Reviews
+            # begin/end after that boundary; read the gateway's live total.
+            payload["active_agents"] = runner._active_work_count()
             try:
                 payload["active_by_profile"] = runner._active_by_profile()
                 payload["active_agents"] = sum(payload["active_by_profile"].values())
             except Exception:
-                # No partial map: an older/uncertain gateway keeps clients conservative.
+                # No partial map; refresh the host-wide count in case a review
+                # started between the first read and attribution failure.
+                payload["active_agents"] = runner._active_work_count()
                 logger.exception("Cannot attribute in-flight work to served profiles")
             return payload
 

@@ -839,11 +839,16 @@ class AIAgent(
             )
 
             def _target_with_requeue() -> None:
-                target()
-                self._maybe_requeue_preempted_review(review_run, dict(
-                    messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                    focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1,
-                    explicit=explicit))
+                try:
+                    target()
+                    self._maybe_requeue_preempted_review(review_run, dict(
+                        messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+                        focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1,
+                        explicit=explicit))
+                finally:
+                    # Covers setup failures before the worker's own cleanup and
+                    # any unexpected exception in its early-return paths.
+                    finish_background_review_run(self, review_run)
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile.

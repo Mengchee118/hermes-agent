@@ -20,6 +20,7 @@ from typing import Mapping, Optional
 # is not folded in yet — another in-flight branch edits that file.)
 DEFAULT_MIME_TO_EXT: dict[str, str] = {
     "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+    "image/heic": ".heic", "image/heif": ".heif",
     "audio/ogg": ".ogg", "audio/x-opus+ogg": ".ogg", "audio/opus": ".ogg",  # whatsapp voice notes
     "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/wav": ".wav",
     "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac",
@@ -30,7 +31,8 @@ DEFAULT_MIME_TO_EXT: dict[str, str] = {
 # the canonical mime). Byte-identical to Signal's historical ``_EXT_TO_MIME``.
 DEFAULT_EXT_TO_MIME: dict[str, str] = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
-    ".webp": "image/webp", ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heif",
+    ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav",
     ".m4a": "audio/mp4", ".aac": "audio/aac", ".mp4": "video/mp4", ".pdf": "application/pdf",
     ".zip": "application/zip",
 }
@@ -83,6 +85,11 @@ def cache_media_bytes(data: bytes, mime: str, *, filename_hint: str = "",
     if kind is None:
         kind = ("image" if primary.startswith("image/")
                 else "audio" if primary.startswith("audio/") else "document")
+    if kind == "document" and len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in {
+        b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1",
+    }:
+        kind = "image"
+        primary = "image/heic"
     if kind == "image":
         ext = ext_for_mime(primary, overrides=ext_overrides, fallback=".jpg") or ".jpg"
         return cache_image_from_bytes(data, ext)

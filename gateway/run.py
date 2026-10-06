@@ -2473,7 +2473,16 @@ def _event_media_kind_is(event, index: int, mime_prefix: str, fallback_types: fr
 
 
 def _event_media_is_image(event, index: int) -> bool:
-    return _event_media_kind_is(event, index, "image/", frozenset({MessageType.PHOTO}))
+    if _event_media_kind_is(event, index, "image/", frozenset({MessageType.PHOTO})):
+        return True
+    # Some clients send a HEIC photo as an uncompressed document with
+    # application/octet-stream. Inspect only cached LOCAL bytes, never remote
+    # URLs or a filename claim, before handing it to the shared image decoder.
+    paths = getattr(event, "media_urls", None) or []
+    if index >= len(paths):
+        return False
+    from gateway.platforms.base import is_local_heic_path
+    return is_local_heic_path(paths[index])
 
 
 def _event_media_is_audio(event, index: int) -> bool:

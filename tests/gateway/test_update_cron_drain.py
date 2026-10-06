@@ -43,3 +43,28 @@ async def test_drain_active_agents_waits_for_in_flight_cron_jobs():
     assert _snapshot == {}
 
 
+@pytest.mark.asyncio
+async def test_drain_waits_for_post_reply_review(monkeypatch, tmp_path):
+    from agent.background_review import prepare_background_review_run, finish_background_review_run
+    import hermes_constants
+    from types import SimpleNamespace
+    from threading import Lock
+
+    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
+    agent = SimpleNamespace(_background_review_run=None, _background_review_lock=Lock())
+    run = prepare_background_review_run(agent)
+    assert run is not None
+    runner, _adapter = make_restart_runner()
+    runner._running_agents = {}
+    drain = asyncio.create_task(runner._drain_active_agents(5.0, 5.0))
+    try:
+        await asyncio.sleep(0.2)
+        assert not drain.done(), 'drain must not pass while a review can still write a skill'
+        assert runner._awaitable_work_count() >= 1
+    finally:
+        finish_background_review_run(agent, run)
+    _snapshot, timed_out = await asyncio.wait_for(drain, timeout=5.0)
+    assert _snapshot == {}
+    assert timed_out is False
+
+

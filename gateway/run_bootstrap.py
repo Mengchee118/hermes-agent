@@ -291,10 +291,12 @@ async def _start_gateway_start_control_socket(runner):
         def _live_status_handler() -> dict:
             from gateway.control_socket import build_status_payload
             payload = build_status_payload()
+            payload['active_agents'] = runner._active_work_count()
             try:
                 payload['active_by_profile'] = runner._active_by_profile()
                 payload['active_agents'] = sum(payload['active_by_profile'].values())
             except Exception:
+                payload['active_agents'] = runner._active_work_count()
                 logger.exception('Cannot attribute in-flight work to served profiles')
             return payload
 

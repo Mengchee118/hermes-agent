@@ -175,6 +175,14 @@ def _review_should_defer(agent: Any, task_cfg: Optional[dict[str, Any]]) -> bool
     return defer_mode(task_cfg) == "auto" and review_targets_managed_local(agent, task_cfg)
 
 
+def _fleet_quiet_active() -> bool:
+    try:
+        from gateway.fleet_quiet import is_active
+        return is_active()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _review_queue_key(agent: Any) -> str:
     return str(getattr(agent, "session_id", None) or id(agent))
 
@@ -780,7 +788,7 @@ class AIAgent(
         kwargs = dict(messages_snapshot=_clone_background_review_messages(messages_snapshot),
                       review_memory=review_memory, review_skills=review_skills, focus=focus, task_cfg=task_cfg,
                       explicit=explicit)
-        if focus is None and not explicit and _review_should_defer(self, task_cfg):
+        if focus is None and not explicit and (_review_should_defer(self, task_cfg) or _fleet_quiet_active()):
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
             return

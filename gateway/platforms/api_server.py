@@ -1284,8 +1284,30 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             return False
 
+    def _fleet_quiet_response(self) -> Optional[web.Response]:
+        """503 ``fleet_update_quiet`` while the shared fleet-update marker is active.
+
+        HTTP callers (Agora rooms, /v1/runs, cron fire) cannot be parked server-side with a live
+        stream, so the hold lives with the caller: it keeps the message and retries after
+        ``Retry-After``; ``/v1/runs`` idempotency keys make that retry duplicate-safe. The body
+        carries the one user-facing notice text so a client shows it once and stays quiet."""
+        try:
+            from gateway import fleet_quiet
+            data = fleet_quiet.read_marker()
+            if not fleet_quiet.is_active(data):
+                return None
+            retry = fleet_quiet.retry_after_s(data)
+            notice = fleet_quiet.NOTICE_TEXT
+        except Exception:
+            return None
+        return _error_response(notice, 503, code="fleet_update_quiet",
+                               headers={"Retry-After": str(retry)})
+
     def _draining_response(self) -> Optional[web.Response]:
         """Return a retryable response while the gateway drains existing work."""
+        quiet = self._fleet_quiet_response()
+        if quiet is not None:
+            return quiet
         if not self._gateway_is_draining():
             return None
         return _error_response(

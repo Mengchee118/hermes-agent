@@ -204,6 +204,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             self._queue_startup_restore_event(event)
             return None
 
+        # Fleet-update quiet window (gateway/fleet_quiet.py): hold AUTHORIZED user inbound durably and
+        # answer once per channel. Unauthorized senders fall through to the normal pairing/ignore path
+        # so the gate never stores, or acknowledges, strangers' traffic.
+        if (not is_internal and not (getattr(event, "metadata", None) or {}).get("fleet_quiet_replay")
+                and self._fleet_quiet_should_hold()
+                and self._is_user_authorized_for_source(source)):
+            await self._fleet_quiet_hold(event)
+            return None
+
         if is_internal:
             return event, source, True
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress

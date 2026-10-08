@@ -104,6 +104,12 @@ def _kanban_dispatch_allowed() -> bool:
     in-flight workers are never touched. Fails open if estop is unimportable.
     """
     try:
+        from gateway.fleet_quiet import is_active as _fleet_quiet_active
+        if _fleet_quiet_active():
+            return False  # fleet update quiet window: spawn nothing new
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         from agent.estop import check_paused
     except ImportError:
         return True

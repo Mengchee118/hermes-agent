@@ -129,7 +129,9 @@ class ReviewIdleQueue:
         return self.quiet_period()[0]
 
     def _pop_dispatchable(self) -> Optional[_PendingReview]:
-        """Oldest aged-out item, else the oldest item once quiet+idle hold."""
+        """Oldest aged-out item, else the oldest item once quiet+idle hold. Nothing during a fleet update."""
+        if _fleet_quiet():
+            return None
         with self._lock:
             if not self._pending:
                 return None
@@ -185,6 +187,14 @@ class ReviewIdleQueue:
             return load_background_review_settings()[0]
         except Exception:
             return True
+
+
+def _fleet_quiet() -> bool:
+    try:
+        from gateway.fleet_quiet import is_active
+        return is_active()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _managed_server_idle() -> bool:

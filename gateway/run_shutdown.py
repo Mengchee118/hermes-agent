@@ -796,6 +796,167 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         )
         self._update_runtime_status(self._serving_state())
 
+    # Fleet-update quiet gate (gateway/fleet_quiet.py): hold authorized inbound in a durable FIFO,
+    # one notice per channel per window, block cron/kanban/review dispatch, replay in order after the
+    # marker releases (also on boot, so a backlog survives a gateway restart mid-update).
+    def _fleet_quiet_should_hold(self) -> bool:
+        # While a released backlog is still replaying, new inbound queues BEHIND it (no notice) so
+        # a fresh message can never overtake the ones held before it.
+        if (getattr(self, "_fleet_quiet_active", False) or getattr(self, "_fleet_quiet_replaying", False)
+                or getattr(self, "_fleet_quiet_backlog", False)):
+            return True
+        try:
+            from gateway import fleet_quiet
+            return fleet_quiet.is_active()
+        except Exception:
+            return False
+
+    async def _fleet_quiet_hold(self, event) -> None:
+        from gateway import fleet_quiet
+        quiet_now = await asyncio.to_thread(fleet_quiet.is_active)
+        if quiet_now:
+            self._fleet_quiet_active = True
+        first = False
+        try:
+            res = await asyncio.to_thread(fleet_quiet.hold, event)
+            if res.get("duplicate"):
+                logger.info("Fleet quiet: duplicate redelivery ignored platform=%s",
+                            getattr(event.source.platform, "value", "?"))
+                return
+            first = res.get("first", False)
+        except fleet_quiet.QueueFull as exc:
+            logger.error("Fleet quiet: hold queue FULL (%s) — message dropped", exc)
+            first = fleet_quiet.channel_key(event.source) not in getattr(self, "_fleet_quiet_overflow_noticed", set())
+            self.__dict__.setdefault("_fleet_quiet_overflow_noticed", set()).add(fleet_quiet.channel_key(event.source))
+        except Exception:
+            logger.error("Fleet quiet: durable hold FAILED — message kept in memory only", exc_info=True)
+            mem = self.__dict__.setdefault("_fleet_quiet_mem_held", [])
+            key = fleet_quiet.channel_key(event.source)
+            first = not any(fleet_quiet.channel_key(e.source) == key for e in mem)
+            mem.append(event)
+        logger.info("Fleet quiet: held inbound platform=%s",
+                    getattr(event.source.platform, "value", "?"))
+        if not first or not quiet_now:
+            return
+        try:
+            adapter = self._delivery_adapter_for(event.source)
+            if adapter is not None:
+                await self._send_busy_reply(event, adapter, fleet_quiet.NOTICE_TEXT)
+        except Exception:
+            logger.warning("Fleet quiet: notice send failed (message still held)", exc_info=True)
+
+    def _fleet_quiet_dispatch_state(self, ev):
+        """``("ok", adapter)`` | ``("wait", None)`` (adapter offline or the session is mid-turn —
+        retry next tick, keep order) for one held event."""
+        adapter = self._intake_adapter_for(ev.source)
+        if adapter is None:
+            adapter = self._delivery_adapter_for(ev.source)
+        if adapter is None:
+            return "wait", None
+        try:
+            key = adapter._event_session_key(ev)
+            if key in getattr(adapter, "_active_sessions", {}):
+                return "wait", None
+        except Exception:
+            pass
+        return "ok", adapter
+
+    async def _fleet_quiet_replay(self) -> int:
+        """Replay held records FIFO per channel. A record whose adapter is offline or whose session
+        is mid-turn is carried (with the rest of its channel) to a newer claim and retried next tick;
+        other channels keep flowing. At-most-once: the cursor is fsynced before each dispatch."""
+        from gateway import fleet_quiet
+        if getattr(self, "_fleet_quiet_replaying", False):
+            return 0
+        self._fleet_quiet_replaying = True
+        replayed = 0
+        carry = None
+        try:
+            mem = self.__dict__.get("_fleet_quiet_mem_held") or []
+            claims = await asyncio.to_thread(fleet_quiet.claim_held)
+            blocked: set = set()
+            for claim in claims:
+                records = await asyncio.to_thread(fleet_quiet._read, claim)
+                idx = await asyncio.to_thread(fleet_quiet.read_cursor, claim)
+                while idx < len(records):
+                    if await asyncio.to_thread(fleet_quiet.is_active):
+                        return replayed  # re-engaged mid-replay: stop, resume after release
+                    rec = records[idx]
+                    chan = rec.get("channel")
+                    try:
+                        ev = fleet_quiet.deserialize_event(rec)
+                    except Exception:
+                        logger.warning("Fleet quiet: undecodable held record skipped", exc_info=True)
+                        idx += 1
+                        await asyncio.to_thread(fleet_quiet.write_cursor, claim, idx)
+                        continue
+                    state, adapter = ("wait", None) if chan in blocked else self._fleet_quiet_dispatch_state(ev)
+                    if state == "wait":
+                        age = time.time() - float(rec.get("held_at") or time.time())
+                        if age >= fleet_quiet.MAX_RECORD_AGE_S:
+                            logger.warning("Fleet quiet: held %s record undeliverable for %.0fh — dropped",
+                                           getattr(ev.source.platform, "value", "?"), age / 3600)
+                        else:
+                            blocked.add(chan)
+                            if carry is None:
+                                carry = await asyncio.to_thread(fleet_quiet.new_carry_path)
+                            await asyncio.to_thread(fleet_quiet.append_carry, carry, rec)
+                        idx += 1
+                        await asyncio.to_thread(fleet_quiet.write_cursor, claim, idx)
+                        continue
+                    idx += 1
+                    await asyncio.to_thread(fleet_quiet.write_cursor, claim, idx)  # at-most-once
+                    try:
+                        await adapter.handle_message(ev)
+                        replayed += 1
+                    except Exception:
+                        logger.warning("Fleet quiet: replay failed for one message; continuing", exc_info=True)
+                await asyncio.to_thread(fleet_quiet.finish_claim, claim)
+            pending_mem = []
+            mem_blocked: set = set()
+            while mem:  # in-memory fallback (disk failed during hold) goes last, same per-channel rule
+                ev = mem.pop(0)
+                key = fleet_quiet.channel_key(ev.source)
+                state, adapter = ("wait", None) if key in mem_blocked else self._fleet_quiet_dispatch_state(ev)
+                if state == "wait":
+                    mem_blocked.add(key)
+                    pending_mem.append(ev)
+                    continue
+                ev.metadata = dict(ev.metadata or {})
+                ev.metadata["fleet_quiet_replay"] = True
+                try:
+                    await adapter.handle_message(ev)
+                    replayed += 1
+                except Exception:
+                    logger.warning("Fleet quiet: replay failed for one message; continuing", exc_info=True)
+            mem.extend(pending_mem)
+            return replayed
+        finally:
+            self._fleet_quiet_replaying = False
+            if replayed:
+                logger.info("Fleet quiet: replayed %d held message(s) in order", replayed)
+
+    async def _fleet_quiet_tick(self) -> None:
+        from gateway import fleet_quiet
+        active = await asyncio.to_thread(fleet_quiet.is_active)
+        was = getattr(self, "_fleet_quiet_active", False)
+        if active and not was:
+            logger.info("Fleet quiet ENGAGED (%s present) — holding inbound", fleet_quiet.MARKER_NAME)
+        elif was and not active:
+            logger.info("Fleet quiet RELEASED — replaying held inbound")
+            self.__dict__.pop("_fleet_quiet_overflow_noticed", None)
+        self._fleet_quiet_active = active
+        if active != was:
+            await asyncio.to_thread(fleet_quiet.write_status)
+        if not active and (self.__dict__.get("_fleet_quiet_mem_held")
+                           or await asyncio.to_thread(fleet_quiet.pending_count)):
+            await self._fleet_quiet_replay()
+            await asyncio.to_thread(fleet_quiet.write_status)
+            self._fleet_quiet_backlog = bool(self.__dict__.get("_fleet_quiet_mem_held")
+                                             or await asyncio.to_thread(fleet_quiet.pending_count))
+        else:
+            self._fleet_quiet_backlog = False
+
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Poll ``.drain_request.json`` at 1s: present -> enter drain, absent -> exit; a stale epoch = absent."""
         from gateway.drain_control import drain_requested
@@ -810,6 +971,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     self._persist_active_agents()
                 else:
                     self._exit_external_drain()
+                await self._fleet_quiet_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

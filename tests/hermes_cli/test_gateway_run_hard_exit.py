@@ -58,6 +58,56 @@ def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
     assert excinfo.value.code == 0
 
 
+def test_join_probe_reports_live_default_executor_worker(monkeypatch, caplog):
+    """A stuck default-executor worker gets a stack, and the probe never holds up exit."""
+    import asyncio
+    import threading
+    import hermes_cli.gateway as gateway_cli
+    import gateway.run as gateway_run
+
+    _prepare(monkeypatch)
+    released = threading.Event()
+    records = []
+    monkeypatch.setattr(gateway_cli, "_make_exit_diag", lambda: lambda tag, **data: records.append((tag, data)))
+
+    async def _start_gateway(**kwargs):
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, released.wait)
+        await asyncio.sleep(0.05)
+        return True
+
+    monkeypatch.setattr(gateway_run, "start_gateway", _start_gateway)
+    original_timer = threading.Timer
+
+    class ImmediateTimer:
+        def __init__(self, delay, callback):
+            assert delay == 5.0
+            self.callback = callback
+            self.daemon = False
+
+        def start(self):
+            try:
+                self.callback()
+            finally:
+                released.set()
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(threading, "Timer", ImmediateTimer)
+    try:
+        with pytest.raises(_HardExitObserved) as excinfo:
+            gateway_cli.run_gateway()
+    finally:
+        released.set()
+        monkeypatch.setattr(threading, "Timer", original_timer)
+    assert excinfo.value.code == 0
+    reports = [data for tag, data in records if tag == "asyncio.executor_join_wait"]
+    assert reports and reports[0]["thread"].startswith("asyncio_")
+    assert any("wait" in call for call in reports[0]["stack"])
+    assert "Default executor still joining" in caplog.text
+
+
 def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
     """KeyboardInterrupt (console Ctrl+C) must also hard-exit, not return.
 

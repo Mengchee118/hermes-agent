@@ -4661,9 +4661,45 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         from gateway.run import _exit_after_graceful_shutdown
         _exit_after_graceful_shutdown(code)
 
+    # The gateway's own pool can be quiescent while asyncio.run() is still
+    # joining its *default* executor for 300 seconds. Capture the surviving
+    # worker's Python stack before that deadline, without logging frame locals
+    # (which may contain credentials or conversation text).
+    _join_probe = None
+
+    async def _run_with_join_probe():
+        nonlocal _join_probe
+        try:
+            return await start_gateway(replace=replace, force=force, verbosity=verbosity)
+        finally:
+            import threading
+            import traceback
+            loop = asyncio.get_running_loop()
+            executor = getattr(loop, "_default_executor", None)
+            threads = tuple(getattr(executor, "_threads", ()) or ())
+            if threads:
+                def _report_slow_join():
+                    frames = sys._current_frames()
+                    for worker in threads:
+                        frame = frames.get(worker.ident)
+                        if not worker.is_alive() or frame is None:
+                            continue
+                        stack = traceback.extract_stack(frame, limit=24)
+                        calls = [f"{item.filename}:{item.lineno}:{item.name}" for item in stack]
+                        _exit_diag("asyncio.executor_join_wait", thread=worker.name, stack=calls)
+                        logger.warning("Default executor still joining at +5s: %s %s", worker.name, " <- ".join(calls))
+
+                _join_probe = threading.Timer(5.0, _report_slow_join)
+                _join_probe.daemon = True
+                _join_probe.start()
+
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity))
+        try:
+            success = asyncio.run(_run_with_join_probe())
+        finally:
+            if _join_probe is not None:
+                _join_probe.cancel()
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.

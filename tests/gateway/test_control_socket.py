@@ -179,6 +179,8 @@ def test_new_server_does_not_unlink_live_predecessor_socket(home: Path):
 def test_new_server_replaces_stale_socket(home: Path):
     async def scenario():
         stale_path, _ = resolve_server_socket_path(home)
+        stale_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stale_path.parent.chmod(0o700)
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(stale_path))
         stale.close()  # socket path remains, but no process listens

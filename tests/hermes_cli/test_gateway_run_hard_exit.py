@@ -21,6 +21,10 @@ class _HardExitObserved(BaseException):
 
 def _prepare(monkeypatch):
     import hermes_cli.gateway as gateway_cli
+    import pm.environments
+    # A source checkout inside the real home is not a sealed payload; importing
+    # gateway.run must not probe the real home's manifest under the I/O guard.
+    monkeypatch.setattr(pm.environments, "_payload_manifest", lambda root: None)
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_cli, "_guard_official_docker_root_gateway", lambda: None)
@@ -58,14 +62,16 @@ def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
     assert excinfo.value.code == 0
 
 
-def test_join_probe_reports_live_default_executor_worker(monkeypatch, caplog):
+def test_join_probe_reports_live_default_executor_worker(monkeypatch, caplog, tmp_path):
     """A stuck default-executor worker gets a stack, and the probe never holds up exit."""
     import asyncio
     import threading
     import hermes_cli.gateway as gateway_cli
-    import gateway.run as gateway_run
+    import hermes_constants
 
     _prepare(monkeypatch)
+    import gateway.run as gateway_run
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
     released = threading.Event()
     records = []
     monkeypatch.setattr(gateway_cli, "_make_exit_diag", lambda: lambda tag, **data: records.append((tag, data)))
@@ -106,6 +112,24 @@ def test_join_probe_reports_live_default_executor_worker(monkeypatch, caplog):
     assert reports and reports[0]["thread"].startswith("asyncio_")
     assert any("wait" in call for call in reports[0]["stack"])
     assert "Default executor still joining" in caplog.text
+    dump = (tmp_path / "logs" / "gateway.error.log").read_text()
+    assert "=== EXECUTOR THREAD DUMP AT LOOP CLOSE ===" in dump
+    assert "asyncio_" in dump
+    assert "Thread" in dump
+    assert "thread name='asyncio_" in caplog.text
+    assert "daemon=False" in caplog.text
+    assert "ident=" in caplog.text
+
+
+def test_dump_failure_does_not_interrupt_shutdown(monkeypatch, tmp_path, caplog):
+    """An unwritable diagnostics path cannot prevent loop teardown."""
+    import hermes_cli.gateway as gateway_cli
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "logs").write_text("not a directory")
+    gateway_cli._dump_executor_threads_at_loop_close()
+    assert "Executor thread dump failed" in caplog.text
 
 
 def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):

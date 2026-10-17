@@ -4552,6 +4552,40 @@ def _make_exit_diag():
     return _exit_diag
 
 
+def _dump_executor_threads_at_loop_close() -> None:
+    """Record thread identities and stacks before asyncio joins its default executor.
+
+    Diagnostic only: never interfere with the gateway's shutdown if logging fails.
+    Frame locals are deliberately excluded from both views.
+    """
+    try:
+        import faulthandler
+        import threading
+        import traceback
+        from hermes_constants import get_hermes_home
+
+        log_path = get_hermes_home() / "logs" / "gateway.error.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        header = "=== EXECUTOR THREAD DUMP AT LOOP CLOSE ==="
+        logger.error("%s pid=%s", header, os.getpid())
+        # faulthandler writes directly to the real error-log descriptor. Keep the
+        # file open until it completes; it does not accept a StringIO object.
+        with open(log_path, "a", encoding="utf-8") as stream:
+            stream.write(f"{header} pid={os.getpid()} (faulthandler)\n")
+            stream.flush()
+            faulthandler.dump_traceback(file=stream, all_threads=True)
+            frames = sys._current_frames()
+            for thread in threading.enumerate():
+                frame = frames.get(thread.ident)
+                stack = "".join(traceback.format_stack(frame)) if frame is not None else "<no Python frame>"
+                detail = (f"{header} thread name={thread.name!r} daemon={thread.daemon} "
+                          f"ident={thread.ident} alive={thread.is_alive()}\n{stack}")
+                stream.write(detail + "\n")
+                logger.error("%s", detail)
+    except Exception:
+        logger.exception("Executor thread dump failed; continuing gateway shutdown")
+
+
 def _respawn_storm_backoff() -> None:
     """Portable app-level respawn-storm breaker (for supervisors without a floor). Defaults mirror
     DEFAULT_CONFIG ``gateway.respawn_storm``; HERMES_GATEWAY_MAX_STARTS / HERMES_GATEWAY_START_WINDOW_S
@@ -4674,6 +4708,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         finally:
             import threading
             import traceback
+            _dump_executor_threads_at_loop_close()
             loop = asyncio.get_running_loop()
             executor = getattr(loop, "_default_executor", None)
             threads = tuple(getattr(executor, "_threads", ()) or ())

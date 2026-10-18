@@ -139,6 +139,7 @@ from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_work as _api_work
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.api_server_bot_chat import reset_local_title_owner
@@ -843,9 +844,8 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
+        reservation = _api_work.acquire(self, "pending")
         token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
         self._persist_active_work()
         try:
             return await handler(self, request, *args, **kwargs)
@@ -855,11 +855,9 @@ def _admit_api_agent_request(handler):
     return _wrapped
 
 
-def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
+def _release_pending_api_work(adapter, reservation: dict) -> None:
     """Release a pending-work reservation exactly once."""
-    if reservation["active"]:
-        reservation["active"] = False
-        adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+    if _api_work.release(adapter, reservation):
         adapter._persist_active_work()
 
 
@@ -878,8 +876,7 @@ def _require_auth(handler):
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits; a handler may detach
     the reservation to a task whose done callback then owns release."""
-    reservation = {"active": True, "detached": False}
-    adapter._pending_agent_requests += 1
+    reservation = _api_work.acquire(adapter, "pending", slot={"detached": False})
     adapter._persist_active_work()
     try:
         yield reservation
@@ -1203,10 +1200,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
         (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
         try:
-            return (int(getattr(self, "_pending_agent_requests", 0))
-                    + int(self._inflight_agent_runs)
-                    + int(self._orphaned_api_workers)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+            # LOCAL PATCH (2026-10-18): lost releases self-correct. Counters are read BEFORE the
+            # lost slots so a release racing this (cross-thread) read can only over-count (BUSY).
+            counted = (int(getattr(self, "_pending_agent_requests", 0))
+                       + int(self._inflight_agent_runs)
+                       + int(self._orphaned_api_workers)
+                       + sum(not task.done() for task in self._active_run_tasks.values()))
+            lost = _api_work.lost_slots(self)
+            _api_work.schedule_reap(self, lost)
+            return max(0, counted - len(lost))
         except Exception:
             return 0
 
@@ -4030,6 +4032,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # The done callback owns the reservation once the task is detached.
                 task = asyncio.create_task(asyncio.to_thread(fire_fn, *fire_args, adapters=adapters, loop=loop))
                 reservation["detached"] = True
+                reservation["owner"] = task  # the handler returns now; the fire task owns release
                 task.add_done_callback(lambda _task: _release_pending_api_work(self, reservation))
                 self._track_background_task(task, tolerate_missing=True)
                 return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
@@ -4343,22 +4346,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
-        self._inflight_agent_runs += 1
-        self._activate_admitted_request()
-        self._persist_active_work()
+        # Owner-checked slot: if the release below is ever skipped, readers drop it once this
+        # task is done instead of reporting BUSY until a restart (LOCAL PATCH 2026-10-18).
+        inflight = _api_work.acquire(self, "inflight")
+        orphan: Optional[dict] = None
         started_at = time.perf_counter()
         usage: Optional[dict[str, Any]] = None
         worker_finished = False
-        handler_cancelled = False
 
         def _worker_finished():
             nonlocal worker_finished
             worker_finished = True
-            if handler_cancelled:
-                self._orphaned_api_workers -= 1
+            if _api_work.release(self, orphan):
                 self._persist_active_work()
 
         try:
+            self._activate_admitted_request()
+            self._persist_active_work()
 # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
             result, usage = await _api_runs._submit_api_worker(loop, _run, on_finished=_worker_finished)
@@ -4367,9 +4371,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # A cancelled handler cannot cancel its executor thread. Keep that thread
             # counted until its own finally publishes completion (never report false SAFE).
             if not worker_finished and asyncio.current_task().cancelling():
-                handler_cancelled = True
-                self._orphaned_api_workers += 1
-            self._inflight_agent_runs -= 1
+                orphan = _api_work.acquire(self, "orphan",
+                                           owner=_api_work.FlagOwner(lambda: worker_finished))
+            _api_work.release(self, inflight)
             self._persist_active_work()
             if usage is not None:
                 self._record_api_metrics(usage, time.perf_counter() - started_at)

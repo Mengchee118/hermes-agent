@@ -2376,6 +2376,11 @@ DEFAULT_CONFIG = {
         # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
         # e.g. on non-admin accounts where /Applications isn't writable.
         "refresh_cua_driver": True,
+        # Path to this host's own updater (e.g. a wrapper that tests local commits before
+        # installing a release). Set in the ROOT config.yaml, every mutating `hermes update`
+        # hands over to it instead of moving the checkout; the wrapper runs the real update with
+        # HERMES_UPDATE_DELEGATED=1. Empty = normal behaviour.
+        "delegate_command": "",
     },
     # LSP diagnostics (pyright, gopls, rust-analyzer...) in the post-write lint check of
     # write_file/patch. Runs only when the cwd or edited file is inside a git worktree; otherwise

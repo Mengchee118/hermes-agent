@@ -2304,6 +2304,9 @@ def _update_preflight_handled(args) -> bool:
         if not any(getattr(args, flag, False) for flag in ("plan", "check", "list_venv_holders")):
             _record_stop("managed_install", without_receipt="refused")  # an update attempt: a metrics row only
         return True
+    from hermes_cli.update_delegate import handle_delegated_update
+
+    handle_delegated_update(args)  # a host-declared updater takes over (never returns) or this run continues
 
     # --plan is read-only and deployment-kind aware, so it runs BEFORE the
     # docker/nix/apt refusal gates: on an image/package-managed install the

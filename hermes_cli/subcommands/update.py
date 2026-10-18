@@ -5,6 +5,18 @@ from __future__ import annotations
 from typing import Callable
 
 
+def _full_commit_id(value: str) -> str:
+    """A full 40/64-hex object id; an abbreviation could name a different commit later."""
+    import argparse
+
+    from hermes_cli._early_recovery import is_object_id
+
+    value = value.strip().lower()
+    if not is_object_id(value):
+        raise argparse.ArgumentTypeError(f"expected a full commit id, got {value!r}")
+    return value
+
+
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     """Attach the ``update`` subcommand to ``subparsers``."""
     from hermes_cli.release_channels import validate_name
@@ -105,6 +117,17 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "Track CHANNEL for this run only (transient override; "
             "--set-channel persists). 'stable' and 'canary' select published "
             "releases, 'main' the branch tip. Source installs only."
+        ),
+    )
+    update_parser.add_argument(
+        "--commit",
+        default=None,
+        type=_full_commit_id,
+        metavar="SHA",
+        help=(
+            "Install exactly this commit (full id) of the selected channel, even if the channel "
+            "has moved on since it was chosen. Refused unless the channel's current target is "
+            "that commit or contains it. For wrappers that test a commit before installing it."
         ),
     )
     update_parser.add_argument(

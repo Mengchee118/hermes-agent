@@ -217,7 +217,8 @@ def select_apply_target(args, branch: str, request: dict, *, git_cmd, stop) -> t
     from hermes_cli.update_cmd_common import _record_stop
 
     if getattr(args, "branch", None):
-        return f"origin/{branch}", None, False, None
+        return _pinned(args, request, f"refs/remotes/origin/{branch}") or (
+            f"origin/{branch}", None, False, None)
     root = _uc()._m().PROJECT_ROOT
     selected = _uc()._update_run_channel(args)
     original = deepcopy(channel_record(require_readable_config_before_write(
@@ -226,7 +227,9 @@ def select_apply_target(args, branch: str, request: dict, *, git_cmd, stop) -> t
     try:
         with retrying_reads():
             target = resolve_source_target(selected, git_cmd, root,
-                                           forward_only=rides_default_channel(original, selected, root))
+                                           # A pinned commit is an explicit choice, never "stay on HEAD".
+                                           forward_only=rides_default_channel(original, selected, root)
+                                           and not getattr(args, "commit", None))
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"✗ Could not resolve the {selected} source channel: {exc}. No update was applied.")
         stop()
@@ -239,7 +242,48 @@ def select_apply_target(args, branch: str, request: dict, *, git_cmd, stop) -> t
     if target.commit:
         print(f"→ {'Release' if target.ahead else 'Latest release'}: {target.label}")
         request["expected_sha"] = target.commit
-        return target.commit, target.commit, target.ahead, target.repository
+        return _pinned(args, request, target.commit, target.repository) or (
+            target.commit, target.commit, target.ahead, target.repository)
     assert target.branch is not None  # a SourceTarget without a commit names its branch
     request["branch"] = target.branch
-    return f"origin/{target.branch}", None, False, target.repository
+    return _pinned(args, request, f"refs/remotes/origin/{target.branch}", target.repository) or (
+        f"origin/{target.branch}", None, False, target.repository)
+
+
+def _pinned(args, request: dict, channel_ref: str, repository=None) -> tuple | None:
+    """``--commit``: the target becomes that exact commit; ``verify_pinned_commit`` proves the
+    channel published it once the fetch has the objects. None when no pin was asked for."""
+    pin = getattr(args, "commit", None)
+    if not pin:
+        return None
+    if pin != channel_ref:
+        print(f"→ Pinned commit {pin[:12]} (the channel now points at {channel_ref.removeprefix('refs/remotes/')[:40]})")
+        request["pin_container"] = channel_ref
+    request["expected_sha"] = pin
+    return pin, pin, False, repository
+
+
+def pinned_fetch_args(request: dict, target_ref: str, branch: str) -> list[str] | None:
+    """The fetch for a pinned run: the pin plus whatever must contain it."""
+    container = request.get("pin_container")
+    if container is None:
+        return None
+    if container.startswith("refs/remotes/origin/"):
+        return ["fetch", "origin", tracking_refspec("origin", branch)]
+    return ["fetch", "--no-tags", "origin", target_ref, container]
+
+
+def verify_pinned_commit(git_cmd, root: Path, request: dict, stop) -> None:
+    """Refuse (exit 1, nothing moved) unless the pinned commit is in the channel's history."""
+    from hermes_cli.update_cmd_common import _record_stop
+
+    container, pin = request.get("pin_container"), request.get("expected_sha")
+    if container is None:
+        return
+    ancestry = subprocess.run([*git_cmd, "merge-base", "--is-ancestor", pin, container], cwd=root,
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if ancestry.returncode != 0:
+        print(f"✗ Commit {pin[:12]} is not part of the selected channel's history. No update was applied.")
+        stop()
+        _record_stop("target_unresolved")
+        sys.exit(1)

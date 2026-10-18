@@ -1904,6 +1904,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             fetch_args = ["fetch", "--no-tags", "origin", target_ref]
         else:
             fetch_args = ["fetch", "origin", _check.tracking_refspec("origin", branch)]
+        fetch_args = _check.pinned_fetch_args(completion_request, target_ref, branch) or fetch_args
         from hermes_cli.gitlock import fetch_with_partial_clone_recovery, is_partial_clone_pack_objects_crash
         # Marking the unmarked packs clears the git 2.53+ partial-clone pack-objects crash (#124272).
         if fetch_args is None:
@@ -1923,6 +1924,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
         current_branch = _current_branch_name(git_cmd, check=True)
+        _check.verify_pinned_commit(git_cmd, _m().PROJECT_ROOT, completion_request,
+                                    lambda: _m()._resume_windows_gateways_after_update(_windows_gateway_resume))
         _commit.record_run_start(git_cmd, _m().PROJECT_ROOT)
         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)
         _plan = _prepare_checkout_for_update(

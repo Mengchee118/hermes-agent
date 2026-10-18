@@ -244,6 +244,14 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         from agent.background_review import active_background_reviews_by_home
         for home, count in active_background_reviews_by_home().items():
             counts[from_home(home)] += count
+        # LOCAL PATCH (2026-10-18, t_dfc1ae6e): managed_turn_count() (managed workers such as
+        # Kanban/agent.managed_worker turns, unmapped executing claims, owner mutations) is in the
+        # host total but had no per-profile source here, so any live managed turn made this raise
+        # and status gave the HOST total to every served profile (all-7 BUSY from one turn).
+        from gateway.session_runtime_workers import uncounted_runtime_work_by_authority
+        for authority, count in uncounted_runtime_work_by_authority(self):
+            if count:
+                counts[from_home(authority.profile_id)] += count
         if set(counts) - set(names) or sum(counts.values()) != self._active_work_count():
             raise ValueError("per-profile work does not match the host total")
         return dict(counts)

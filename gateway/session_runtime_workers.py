@@ -12,15 +12,30 @@ def executing_sessions(authority):
             yield sid, live, execution['execution_generation']
 
 
+def uncounted_runtime_work_by_authority(runner):
+    """``uncounted_runtime_work`` split per served authority: ``[(authority, units), ...]``.
+
+    LOCAL PATCH (2026-10-18, t_dfc1ae6e): ``_active_by_profile`` attributes every unit of the host
+    total to a profile and refuses when the parts don't sum. Managed workers / unmapped claims /
+    owner mutations were in the host total but had no per-profile source, so every live managed
+    turn (e.g. a Kanban worker) made attribution raise and status fell back to the host total for
+    ALL served profiles -> fleet-wide false BUSY. One counting rule, two shapes, so they can't drift.
+    """
+    running = getattr(runner, '_running_agents', {})
+    out = []
+    for authority in all_authorities(runner):
+        workers = getattr(authority, '_managed_workers', {})
+        units = (sum(not worker.closed.is_set() for worker in workers.values())
+                 + sum(live.route not in running and sid not in workers
+                       for sid, live, _ in executing_sessions(authority))
+                 + len(mutation_tasks(authority)))
+        out.append((authority, units))
+    return out
+
+
 def uncounted_runtime_work(runner):
     """Count claims absent from the ordinary agent map, including pre-bootstrap managed turns."""
-    running = getattr(runner, '_running_agents', {})
-    authorities = all_authorities(runner)
-    managed = sum(not worker.closed.is_set() for authority in authorities
-                  for worker in getattr(authority, '_managed_workers', {}).values())
-    return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
-                for authority in authorities for sid, live, _ in executing_sessions(authority))
-            + sum(len(mutation_tasks(authority)) for authority in authorities))
+    return sum(units for _authority, units in uncounted_runtime_work_by_authority(runner))
 
 
 def persist_work_count(authority, _task=None):
